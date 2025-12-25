@@ -45,7 +45,13 @@ out/
 *.jsonl
 *.jsonl.gz
 
+# Environment
+.env
+.env.local
+
 # OS
 .DS_Store
 Thumbs.db
 
+audit.log
+Arzule MVP*.md

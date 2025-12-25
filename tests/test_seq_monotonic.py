@@ -2,8 +2,6 @@
 
 import json
 
-import pytest
-
 from arzule_ingest.run import ArzuleRun
 from arzule_ingest.sinks.base import TelemetrySink
 

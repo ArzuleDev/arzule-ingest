@@ -1,7 +1,5 @@
 """Tests for handoff key injection and extraction."""
 
-import pytest
-
 from arzule_ingest.crewai.handoff import (
     DELEGATION_TOOL_NAMES,
     extract_handoff_key_from_text,

@@ -1,4 +1,4 @@
-"""CrewAI event listener for lifecycle events."""
+"""CrewAI event listener for lifecycle events (CrewAI 1.7.x API)."""
 
 from __future__ import annotations
 
@@ -33,94 +33,149 @@ class ArzuleCrewAIListener:
             return
 
         try:
-            from crewai.utilities.events.event_handler import EventHandler
+            from crewai.events.event_bus import crewai_event_bus
         except ImportError:
             import sys
 
-            print("[arzule] CrewAI event handler not available", file=sys.stderr)
+            print("[arzule] CrewAI event bus not available", file=sys.stderr)
             return
 
-        # Get or create the event handler
-        handler = EventHandler()
+        # Register for crew events
+        self._register_crew_events(crewai_event_bus)
 
-        # Try to register for various event types
-        self._register_crew_events(handler)
-        self._register_agent_events(handler)
-        self._register_task_events(handler)
+        # Register for agent events
+        self._register_agent_events(crewai_event_bus)
+
+        # Register for task events
+        self._register_task_events(crewai_event_bus)
+
+        # Register for tool events
+        self._register_tool_events(crewai_event_bus)
+
+        # Register for LLM events
+        self._register_llm_events(crewai_event_bus)
 
         self._setup_complete = True
 
-    def _register_crew_events(self, handler: Any) -> None:
+    def _register_crew_events(self, bus: Any) -> None:
         """Register crew lifecycle event handlers."""
         try:
-            from crewai.utilities.events.crew_events import (
+            from crewai.events.types.crew_events import (
                 CrewKickoffCompletedEvent,
                 CrewKickoffFailedEvent,
                 CrewKickoffStartedEvent,
             )
 
-            @handler.on(CrewKickoffStartedEvent)
-            def on_crew_start(source: Any, event: Any) -> None:
+            @bus.on(CrewKickoffStartedEvent)
+            def on_crew_start(source: Any, event: CrewKickoffStartedEvent) -> None:
                 self._handle_event(event)
 
-            @handler.on(CrewKickoffCompletedEvent)
-            def on_crew_complete(source: Any, event: Any) -> None:
+            @bus.on(CrewKickoffCompletedEvent)
+            def on_crew_complete(source: Any, event: CrewKickoffCompletedEvent) -> None:
                 self._handle_event(event)
 
-            @handler.on(CrewKickoffFailedEvent)
-            def on_crew_failed(source: Any, event: Any) -> None:
+            @bus.on(CrewKickoffFailedEvent)
+            def on_crew_failed(source: Any, event: CrewKickoffFailedEvent) -> None:
                 self._handle_event(event)
 
         except ImportError:
             pass
 
-    def _register_agent_events(self, handler: Any) -> None:
+    def _register_agent_events(self, bus: Any) -> None:
         """Register agent lifecycle event handlers."""
         try:
-            from crewai.utilities.events.agent_events import (
+            from crewai.events.types.agent_events import (
                 AgentExecutionCompletedEvent,
-                AgentExecutionFailedEvent,
+                AgentExecutionErrorEvent,
                 AgentExecutionStartedEvent,
             )
 
-            @handler.on(AgentExecutionStartedEvent)
-            def on_agent_start(source: Any, event: Any) -> None:
+            @bus.on(AgentExecutionStartedEvent)
+            def on_agent_start(source: Any, event: AgentExecutionStartedEvent) -> None:
                 self._handle_event(event)
 
-            @handler.on(AgentExecutionCompletedEvent)
-            def on_agent_complete(source: Any, event: Any) -> None:
+            @bus.on(AgentExecutionCompletedEvent)
+            def on_agent_complete(source: Any, event: AgentExecutionCompletedEvent) -> None:
                 self._handle_event(event)
 
-            @handler.on(AgentExecutionFailedEvent)
-            def on_agent_failed(source: Any, event: Any) -> None:
+            @bus.on(AgentExecutionErrorEvent)
+            def on_agent_error(source: Any, event: AgentExecutionErrorEvent) -> None:
                 self._handle_event(event)
 
         except ImportError:
             pass
 
-    def _register_task_events(self, handler: Any) -> None:
+    def _register_task_events(self, bus: Any) -> None:
         """Register task lifecycle event handlers."""
         try:
-            from crewai.utilities.events.task_events import (
+            from crewai.events.types.task_events import (
                 TaskCompletedEvent,
                 TaskFailedEvent,
                 TaskStartedEvent,
             )
 
-            @handler.on(TaskStartedEvent)
-            def on_task_start(source: Any, event: Any) -> None:
+            @bus.on(TaskStartedEvent)
+            def on_task_start(source: Any, event: TaskStartedEvent) -> None:
                 self._handle_event(event)
                 self._check_handoff_ack(event)
 
-            @handler.on(TaskCompletedEvent)
-            def on_task_complete(source: Any, event: Any) -> None:
+            @bus.on(TaskCompletedEvent)
+            def on_task_complete(source: Any, event: TaskCompletedEvent) -> None:
                 self._handle_event(event)
                 self._check_handoff_complete(event, status="ok")
 
-            @handler.on(TaskFailedEvent)
-            def on_task_failed(source: Any, event: Any) -> None:
+            @bus.on(TaskFailedEvent)
+            def on_task_failed(source: Any, event: TaskFailedEvent) -> None:
                 self._handle_event(event)
                 self._check_handoff_complete(event, status="error")
+
+        except ImportError:
+            pass
+
+    def _register_tool_events(self, bus: Any) -> None:
+        """Register tool usage event handlers."""
+        try:
+            from crewai.events.types.tool_usage_events import (
+                ToolUsageFinishedEvent,
+                ToolUsageStartedEvent,
+                ToolUsageErrorEvent,
+            )
+
+            @bus.on(ToolUsageStartedEvent)
+            def on_tool_start(source: Any, event: ToolUsageStartedEvent) -> None:
+                self._handle_event(event)
+
+            @bus.on(ToolUsageFinishedEvent)
+            def on_tool_end(source: Any, event: ToolUsageFinishedEvent) -> None:
+                self._handle_event(event)
+
+            @bus.on(ToolUsageErrorEvent)
+            def on_tool_error(source: Any, event: ToolUsageErrorEvent) -> None:
+                self._handle_event(event)
+
+        except ImportError:
+            pass
+
+    def _register_llm_events(self, bus: Any) -> None:
+        """Register LLM call event handlers."""
+        try:
+            from crewai.events.types.llm_events import (
+                LLMCallCompletedEvent,
+                LLMCallFailedEvent,
+                LLMCallStartedEvent,
+            )
+
+            @bus.on(LLMCallStartedEvent)
+            def on_llm_start(source: Any, event: LLMCallStartedEvent) -> None:
+                self._handle_event(event)
+
+            @bus.on(LLMCallCompletedEvent)
+            def on_llm_complete(source: Any, event: LLMCallCompletedEvent) -> None:
+                self._handle_event(event)
+
+            @bus.on(LLMCallFailedEvent)
+            def on_llm_failed(source: Any, event: LLMCallFailedEvent) -> None:
+                self._handle_event(event)
 
         except ImportError:
             pass
@@ -201,4 +256,3 @@ def get_listener() -> ArzuleCrewAIListener:
     if _listener_instance is None:
         _listener_instance = ArzuleCrewAIListener()
     return _listener_instance
-

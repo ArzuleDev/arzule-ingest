@@ -22,7 +22,11 @@ class ArzuleConfig:
 
     # Redaction toggles
     redact_enabled: bool = True
-    redact_pii: bool = False
+    redact_pii: bool = True  # SOC2: PII redaction enabled by default
+
+    # SOC2 compliance settings
+    require_tls: bool = True  # Enforce HTTPS for HTTP sink
+    audit_log_enabled: bool = True  # Enable audit logging
 
     # Payload size limits
     max_inline_payload_bytes: int = 64 * 1024  # 64KB
@@ -57,7 +61,11 @@ class ArzuleConfig:
             flush_interval_seconds=float(_get("FLUSH_INTERVAL") or "5.0"),
             redact_enabled=(_get("REDACT_ENABLED") or "true").lower()
             in {"1", "true", "yes", "y"},
-            redact_pii=(_get("REDACT_PII") or "false").lower()
+            redact_pii=(_get("REDACT_PII") or "true").lower()  # SOC2: default true
+            in {"1", "true", "yes", "y"},
+            require_tls=(_get("REQUIRE_TLS") or "true").lower()  # SOC2: enforce TLS
+            in {"1", "true", "yes", "y"},
+            audit_log_enabled=(_get("AUDIT_LOG_ENABLED") or "true").lower()
             in {"1", "true", "yes", "y"},
             max_inline_payload_bytes=int(
                 _get("MAX_INLINE_BYTES") or str(64 * 1024)

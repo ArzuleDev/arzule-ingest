@@ -97,3 +97,4 @@ class HttpBlobStorage(BlobStorage):
 
         return response.content
 
+

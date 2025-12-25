@@ -73,3 +73,4 @@ def is_instrumented() -> bool:
     """Check if CrewAI has been instrumented."""
     return _instrumented
 
+

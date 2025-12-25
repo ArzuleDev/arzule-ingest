@@ -243,3 +243,4 @@ def emit_handoff_complete(
         "raw_ref": {"storage": "inline"},
     })
 
+

@@ -1,22 +1,58 @@
 [project]
 name = "arzule-ingest"
 version = "0.1.0"
-description = "Observability wrapper for CrewAI that emits TraceEvent JSONL with handoff edge derivation"
+description = "Lightweight SDK for capturing multi-agent traces and sending to Arzule"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Proprietary" }
+license = { text = "MIT" }
 authors = [{ name = "Arzule" }]
+keywords = ["observability", "tracing", "multi-agent", "crewai", "agents", "llm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Monitoring",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+# Core dependencies - minimal footprint
 dependencies = [
-    "crewai>=0.80.0",
     "httpx>=0.27.0",
     "pydantic>=2.0.0",
 ]
 
 [project.optional-dependencies]
+# CrewAI integration (optional - only needed if using CrewAI)
+crewai = [
+    "crewai>=0.80.0",
+]
+# SOC2: Encryption at rest requires cryptography
+soc2 = [
+    "cryptography>=42.0.0",
+]
+# Full install with all optional deps
+all = [
+    "crewai>=0.80.0",
+    "cryptography>=42.0.0",
+]
+# Development dependencies (not published)
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
+    "cryptography>=42.0.0",
+    "crewai>=0.80.0",
 ]
+
+[project.scripts]
+arzule = "arzule_ingest.cli:main"
+
+[project.urls]
+Homepage = "https://arzule.com"
+Documentation = "https://docs.arzule.com"
+Repository = "https://github.com/arzule/arzule-ingest"
 
 [build-system]
 requires = ["hatchling"]
@@ -24,6 +60,16 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/arzule_ingest"]
+
+# Exclude private/internal modules from published package
+[tool.hatch.build.targets.wheel.force-include]
+
+[tool.hatch.build]
+exclude = [
+    "src/arzule_ingest/forensics",
+    "src/arzule_ingest/demo",
+    "src/arzule_ingest/scenarios",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

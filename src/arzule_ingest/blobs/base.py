@@ -36,3 +36,4 @@ class BlobStorage(ABC):
         """
         ...
 
+

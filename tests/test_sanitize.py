@@ -1,7 +1,5 @@
 """Tests for payload sanitization."""
 
-import pytest
-
 from arzule_ingest.sanitize import (
     redact_pii,
     redact_secrets,

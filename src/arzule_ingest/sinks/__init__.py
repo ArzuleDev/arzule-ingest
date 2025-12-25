@@ -2,7 +2,7 @@
 
 from .base import TelemetrySink
 from .file_jsonl import JsonlFileSink
-from .http_batch import HttpBatchSink
+from .http_batch import HttpBatchSink, TLSRequiredError
 
-__all__ = ["TelemetrySink", "JsonlFileSink", "HttpBatchSink"]
+__all__ = ["TelemetrySink", "JsonlFileSink", "HttpBatchSink", "TLSRequiredError"]
 

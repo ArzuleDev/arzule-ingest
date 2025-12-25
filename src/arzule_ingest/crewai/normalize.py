@@ -87,10 +87,20 @@ def evt_from_crewai_event(run: "ArzuleRun", event: Any) -> dict[str, Any]:
         "AgentExecutionStartedEvent": "agent.execution.start",
         "AgentExecutionCompletedEvent": "agent.execution.complete",
         "AgentExecutionFailedEvent": "agent.execution.failed",
+        "AgentExecutionErrorEvent": "agent.execution.error",
         # Task lifecycle
         "TaskStartedEvent": "task.start",
         "TaskCompletedEvent": "task.complete",
         "TaskFailedEvent": "task.failed",
+        # Tool usage (CrewAI 1.7.x)
+        "ToolUsageStartedEvent": "tool.call.start",
+        "ToolUsageFinishedEvent": "tool.call.end",
+        "ToolUsageErrorEvent": "tool.call.error",
+        "ToolUsageEvent": "tool.call",
+        # LLM calls (CrewAI 1.7.x)
+        "LLMCallStartedEvent": "llm.call.start",
+        "LLMCallCompletedEvent": "llm.call.end",
+        "LLMCallFailedEvent": "llm.call.error",
         # Flow events
         "FlowStartedEvent": "flow.start",
         "FlowFinishedEvent": "flow.complete",
@@ -100,10 +110,10 @@ def evt_from_crewai_event(run: "ArzuleRun", event: Any) -> dict[str, Any]:
 
     # Determine status
     status = "ok"
-    if "Failed" in event_class:
+    if "Failed" in event_class or "Error" in event_class:
         status = "error"
 
-    # Extract agent/task info
+    # Extract agent/task/tool info
     agent = _safe_getattr(event, "agent", None)
     task = _safe_getattr(event, "task", None)
     crew = _safe_getattr(event, "crew", None)
@@ -111,12 +121,19 @@ def evt_from_crewai_event(run: "ArzuleRun", event: Any) -> dict[str, Any]:
     agent_info = _extract_agent_info(agent)
     task_id, task_desc = _extract_task_info(task)
 
+    # Tool info for tool events
+    tool_name = _safe_getattr(event, "tool_name", None)
+    tool_input = _safe_getattr(event, "tool_input", None)
+    tool_output = _safe_getattr(event, "tool_output", None) or _safe_getattr(event, "output", None)
+
     # Build summary
     summary_parts = [event_type]
     if agent_info:
         summary_parts.append(f"agent={agent_info['role']}")
     if task_id:
         summary_parts.append(f"task={task_id}")
+    if tool_name:
+        summary_parts.append(f"tool={tool_name}")
     summary = " ".join(summary_parts)
 
     # Extract result/error for completed/failed events
@@ -146,6 +163,14 @@ def evt_from_crewai_event(run: "ArzuleRun", event: Any) -> dict[str, Any]:
             "description": _safe_getattr(task, "description", None),
             "expected_output": _safe_getattr(task, "expected_output", None),
         })
+
+    # Tool info in payload/attrs
+    if tool_name:
+        attrs["tool_name"] = tool_name
+    if tool_input is not None:
+        payload["tool_input"] = sanitize(tool_input)
+    if tool_output is not None:
+        payload["tool_output"] = sanitize(tool_output)
 
     return {
         "schema_version": "trace_event.v0_1",

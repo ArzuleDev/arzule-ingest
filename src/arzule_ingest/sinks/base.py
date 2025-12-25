@@ -23,3 +23,4 @@ class TelemetrySink(ABC):
         """Close the sink and release resources."""
         self.flush()
 
+
