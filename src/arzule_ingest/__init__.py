@@ -11,7 +11,7 @@ from .run import ArzuleRun, current_run
 from .config import ArzuleConfig
 from .audit import AuditLogger, audit_log
 
-__version__ = "0.1.0"
+__version__ = "0.3.1"
 __all__ = [
     "ArzuleRun",
     "current_run",
@@ -41,6 +41,28 @@ def _check_crewai_available() -> bool:
         return False
 
 
+def _check_langchain_available() -> bool:
+    """Check if LangChain is installed."""
+    try:
+        import langchain_core  # noqa: F401
+        return True
+    except ImportError:
+        try:
+            import langchain  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+
+def _check_autogen_available() -> bool:
+    """Check if Microsoft AutoGen is installed."""
+    try:
+        import autogen  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def init(
     api_key: Optional[str] = None,
     tenant_id: Optional[str] = None,
@@ -62,7 +84,7 @@ def init(
         tenant_id: Tenant ID. Defaults to ARZULE_TENANT_ID env var.
         project_id: Project ID. Defaults to ARZULE_PROJECT_ID env var.
         ingest_url: Backend URL. Defaults to ARZULE_INGEST_URL or Arzule cloud.
-        auto_instrument: If True, automatically instruments CrewAI (if installed).
+        auto_instrument: If True, automatically instruments CrewAI/LangChain (if installed).
         require_tls: If True, requires HTTPS (recommended for production).
 
     Returns:
@@ -123,6 +145,24 @@ def init(
         except ImportError:
             # CrewAI integration not available, that's ok
             print("[arzule] CrewAI not installed, skipping auto-instrumentation", file=sys.stderr)
+
+    # Auto-instrument LangChain if available
+    if auto_instrument and _check_langchain_available():
+        try:
+            from .langchain.install import instrument_langchain
+            instrument_langchain()
+        except ImportError:
+            # LangChain integration not available, that's ok
+            print("[arzule] LangChain not installed, skipping auto-instrumentation", file=sys.stderr)
+
+    # Auto-instrument AutoGen if available
+    if auto_instrument and _check_autogen_available():
+        try:
+            from .autogen.install import instrument_autogen
+            instrument_autogen()
+        except ImportError:
+            # AutoGen integration not available, that's ok
+            print("[arzule] AutoGen not installed, skipping auto-instrumentation", file=sys.stderr)
 
     _config = {
         "tenant_id": tenant_id,

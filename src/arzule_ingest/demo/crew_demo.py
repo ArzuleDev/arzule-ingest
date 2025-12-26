@@ -6,6 +6,24 @@ import os
 from pathlib import Path
 
 
+def _load_env() -> None:
+    """Load environment variables from .env file if it exists."""
+    env_path = Path(__file__).parents[3] / ".env"
+    if not env_path.exists():
+        return
+
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            if key and value and key not in os.environ:
+                os.environ[key] = value
+
+
 def run_demo(output_path: str = "out/demo_trace.jsonl") -> None:
     """
     Run a demo crew with delegation to generate trace events.
@@ -16,11 +34,21 @@ def run_demo(output_path: str = "out/demo_trace.jsonl") -> None:
     Args:
         output_path: Path to write the JSONL trace file
     """
+    # Load .env file first
+    _load_env()
+
+    # Check for API key
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print("ANTHROPIC_API_KEY not set.")
+        print("Create a .env file in the project root with:")
+        print("  ANTHROPIC_API_KEY=sk-ant-...")
+        return
+
     # Import here to avoid requiring crewai for non-demo usage
     try:
-        from crewai import Agent, Crew, Task
+        from crewai import Agent, Crew, LLM, Task
     except ImportError:
-        print("CrewAI not installed. Run: pip install crewai")
+        print("CrewAI not installed. Run: pip install 'crewai[tools]'")
         return
 
     from ..crewai import instrument_crewai
@@ -33,11 +61,15 @@ def run_demo(output_path: str = "out/demo_trace.jsonl") -> None:
     # Ensure output directory exists
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
+    # Configure Anthropic LLM
+    llm = LLM(model="anthropic/claude-3-haiku-20240307")
+
     # Create agents
     researcher = Agent(
         role="Researcher",
         goal="Find accurate information on topics",
         backstory="You are an expert researcher who can find and synthesize information.",
+        llm=llm,
         verbose=True,
         allow_delegation=True,  # Can delegate to writer
     )
@@ -46,6 +78,7 @@ def run_demo(output_path: str = "out/demo_trace.jsonl") -> None:
         role="Writer",
         goal="Write clear and engaging content",
         backstory="You are a skilled writer who creates compelling content.",
+        llm=llm,
         verbose=True,
         allow_delegation=False,
     )

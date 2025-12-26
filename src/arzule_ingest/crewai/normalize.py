@@ -172,6 +172,19 @@ def evt_from_crewai_event(run: "ArzuleRun", event: Any) -> dict[str, Any]:
     if tool_output is not None:
         payload["tool_output"] = sanitize(tool_output)
 
+    # LLM event info in payload
+    messages = _safe_getattr(event, "messages", None)
+    if messages is not None:
+        payload["messages"] = _truncate_messages(messages)
+        attrs["message_count"] = len(messages) if isinstance(messages, list) else 0
+
+    response = _safe_getattr(event, "response", None)
+    if response is not None:
+        content = _safe_getattr(response, "content", None)
+        if content is None:
+            content = str(response)
+        payload["response"] = truncate_string(str(content), 2000)
+
     return {
         "schema_version": "trace_event.v0_1",
         "run_id": run.run_id,
@@ -182,6 +195,7 @@ def evt_from_crewai_event(run: "ArzuleRun", event: Any) -> dict[str, Any]:
         "parent_span_id": run.current_parent_span_id(),
         "seq": run.next_seq(),
         "ts": run.now(),
+        "workstream_id": None,
         "agent": agent_info,
         "task_id": task_id,
         "event_type": event_type,
