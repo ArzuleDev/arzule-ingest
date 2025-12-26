@@ -55,3 +55,6 @@ Thumbs.db
 
 audit.log
 Arzule MVP*.md
+.cache/
+test_*.py
+src/arzule_ingest/scenarios/
