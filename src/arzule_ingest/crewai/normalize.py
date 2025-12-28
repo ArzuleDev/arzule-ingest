@@ -31,6 +31,22 @@ def _extract_agent_info(agent: Any) -> Optional[dict[str, Any]]:
     }
 
 
+def extract_agent_info_from_event(event: Any) -> Optional[dict[str, Any]]:
+    """Extract agent info dict from a CrewAI event object.
+    
+    This is a convenience function for the listener to extract agent info
+    from event bus events for thread-local agent tracking.
+    
+    Args:
+        event: CrewAI event object (e.g., AgentExecutionStartedEvent)
+        
+    Returns:
+        Agent info dict with 'id' and 'role', or None if no agent
+    """
+    agent = _safe_getattr(event, "agent", None)
+    return _extract_agent_info(agent)
+
+
 def _extract_task_info(task: Any) -> tuple[Optional[str], Optional[str]]:
     """Extract task ID and description from CrewAI task."""
     if not task:
@@ -39,6 +55,72 @@ def _extract_task_info(task: Any) -> tuple[Optional[str], Optional[str]]:
     task_id = _safe_getattr(task, "id", None) or _safe_getattr(task, "name", None)
     description = _safe_getattr(task, "description", None)
     return task_id, description
+
+
+def _extract_token_usage(response: Any) -> Optional[dict[str, int]]:
+    """Extract token usage from LLM response.
+    
+    Supports multiple formats:
+    - OpenAI/LiteLLM: response.usage.{prompt_tokens, completion_tokens, total_tokens}
+    - usage_metadata: response.usage_metadata.{input_tokens, output_tokens}
+    - Direct attributes: response.{prompt_tokens, completion_tokens, total_tokens}
+    
+    Returns:
+        Dict with token counts or None if not available
+    """
+    if not response:
+        return None
+    
+    result: dict[str, int] = {}
+    
+    # Try response.usage (OpenAI/LiteLLM format)
+    usage = _safe_getattr(response, "usage", None)
+    if usage:
+        prompt = _safe_getattr(usage, "prompt_tokens", None)
+        completion = _safe_getattr(usage, "completion_tokens", None)
+        total = _safe_getattr(usage, "total_tokens", None)
+        
+        # Also check for input_tokens/output_tokens naming
+        if prompt is None:
+            prompt = _safe_getattr(usage, "input_tokens", None)
+        if completion is None:
+            completion = _safe_getattr(usage, "output_tokens", None)
+        
+        if prompt is not None:
+            result["prompt_tokens"] = int(prompt)
+        if completion is not None:
+            result["completion_tokens"] = int(completion)
+        if total is not None:
+            result["total_tokens"] = int(total)
+        elif prompt is not None and completion is not None:
+            result["total_tokens"] = int(prompt) + int(completion)
+    
+    # Try response.usage_metadata (some providers)
+    if not result:
+        usage_meta = _safe_getattr(response, "usage_metadata", None)
+        if usage_meta:
+            input_tokens = _safe_getattr(usage_meta, "input_tokens", None)
+            output_tokens = _safe_getattr(usage_meta, "output_tokens", None)
+            
+            if input_tokens is not None:
+                result["prompt_tokens"] = int(input_tokens)
+            if output_tokens is not None:
+                result["completion_tokens"] = int(output_tokens)
+            if input_tokens is not None and output_tokens is not None:
+                result["total_tokens"] = int(input_tokens) + int(output_tokens)
+    
+    # Try dict-style access (some responses are dicts)
+    if not result and isinstance(response, dict):
+        usage = response.get("usage", {})
+        if usage:
+            if "prompt_tokens" in usage:
+                result["prompt_tokens"] = int(usage["prompt_tokens"])
+            if "completion_tokens" in usage:
+                result["completion_tokens"] = int(usage["completion_tokens"])
+            if "total_tokens" in usage:
+                result["total_tokens"] = int(usage["total_tokens"])
+    
+    return result if result else None
 
 
 def _base(
@@ -208,6 +290,11 @@ def evt_from_crewai_event(
         if content is None:
             content = str(response)
         payload["response"] = truncate_string(str(content), 2000)
+        
+        # Extract token usage from LLM response (LiteLLM/OpenAI format)
+        token_usage = _extract_token_usage(response)
+        if token_usage:
+            attrs.update(token_usage)
 
     # Determine parent span:
     # 1. Use explicit parent_span_id if provided (concurrent mode)
@@ -408,12 +495,19 @@ def evt_llm_end(run: "ArzuleRun", context: Any, span_id: Optional[str]) -> dict[
     status = "error" if error else "ok"
 
     payload: dict[str, Any] = {}
+    attrs: dict[str, Any] = {}
+    
     if response is not None:
         # Extract content from response object or use as string
         content = _safe_getattr(response, "content", None)
         if content is None:
             content = str(response)
         payload["response"] = truncate_string(str(content), 2000)
+        
+        # Extract token usage for per-agent tracking
+        token_usage = _extract_token_usage(response)
+        if token_usage:
+            attrs.update(token_usage)
 
     if error:
         payload["error"] = truncate_string(str(error), 500)
@@ -425,7 +519,7 @@ def evt_llm_end(run: "ArzuleRun", context: Any, span_id: Optional[str]) -> dict[
         "event_type": "llm.call.end",
         "status": status,
         "summary": "llm response received",
-        "attrs_compact": {},
+        "attrs_compact": attrs,
         "payload": payload,
     }
 

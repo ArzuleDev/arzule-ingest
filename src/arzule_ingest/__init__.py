@@ -7,7 +7,7 @@ import os
 import sys
 from typing import Optional
 
-from .run import ArzuleRun, current_run
+from .run_context import ArzuleRun, current_run
 from .config import ArzuleConfig
 from .audit import AuditLogger, audit_log
 

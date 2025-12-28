@@ -18,7 +18,7 @@ import uuid
 
 from ..ids import new_span_id
 from ..logger import log_event_dropped
-from ..run import current_run
+from ..run import clear_current_agent_context, current_run
 from .handoff import (
     emit_handoff_ack,
     emit_handoff_complete,
@@ -26,7 +26,12 @@ from .handoff import (
     is_delegation_tool,
     maybe_emit_handoff_proposed,
 )
-from .normalize import evt_from_crewai_event, evt_async_spawn, evt_async_join
+from .normalize import (
+    evt_from_crewai_event,
+    evt_async_spawn,
+    evt_async_join,
+    extract_agent_info_from_event,
+)
 
 if TYPE_CHECKING:
     from ..run import ArzuleRun
@@ -199,7 +204,13 @@ class ArzuleCrewAIListener:
             pass
 
     def _register_agent_events(self, bus: Any) -> None:
-        """Register agent lifecycle event handlers."""
+        """Register agent lifecycle event handlers.
+        
+        Agent events use dedicated handlers to track the current agent in
+        thread-local storage. This enables LLM and tool events (which often
+        don't include agent context from CrewAI) to be attributed to the
+        correct agent.
+        """
         try:
             from crewai.events.types.agent_events import (
                 AgentExecutionCompletedEvent,
@@ -209,15 +220,15 @@ class ArzuleCrewAIListener:
 
             @bus.on(AgentExecutionStartedEvent)
             def on_agent_start(source: Any, event: AgentExecutionStartedEvent) -> None:
-                self._handle_event(event)
+                self._handle_agent_start(event)
 
             @bus.on(AgentExecutionCompletedEvent)
             def on_agent_complete(source: Any, event: AgentExecutionCompletedEvent) -> None:
-                self._handle_event(event)
+                self._handle_agent_end(event, status="ok")
 
             @bus.on(AgentExecutionErrorEvent)
             def on_agent_error(source: Any, event: AgentExecutionErrorEvent) -> None:
-                self._handle_event(event)
+                self._handle_agent_end(event, status="error")
 
         except ImportError:
             pass
@@ -501,7 +512,82 @@ class ArzuleCrewAIListener:
             run.emit(trace_event)
 
     # =========================================================================
-    # Generic Event Handler (for agent, tool, LLM events)
+    # Agent Lifecycle Handlers (with thread-local agent tracking)
+    # =========================================================================
+
+    def _handle_agent_start(self, event: Any) -> None:
+        """Handle agent execution start - set thread-local agent context.
+        
+        This is critical for proper attribution of LLM and tool events to agents.
+        When an agent starts executing in a thread, we store its info so that
+        subsequent events in the same thread can be attributed to it.
+        """
+        run = self._get_run_with_fallback(event.__class__.__name__)
+        if not run:
+            return
+
+        # Extract and store agent info for this thread
+        agent_info = extract_agent_info_from_event(event)
+        if agent_info:
+            run.set_current_agent(agent_info)
+
+        # Emit the event as normal
+        task_key = _get_task_key(event)
+        agent_key = _get_agent_key(event)
+        parent_span_id = run.get_task_parent_span(task_key=task_key, agent_key=agent_key)
+
+        trace_event = evt_from_crewai_event(
+            run, event,
+            parent_span_id=parent_span_id,
+            task_key=task_key,
+        )
+
+        if task_key:
+            trace_event["attrs_compact"]["task_key"] = task_key
+        if run.has_concurrent_tasks():
+            trace_event["attrs_compact"]["concurrent_mode"] = True
+
+        run.emit(trace_event)
+
+    def _handle_agent_end(self, event: Any, status: str) -> None:
+        """Handle agent execution end - clear thread-local agent context.
+        
+        Clears the agent context so that events after the agent finishes
+        won't be incorrectly attributed to it.
+        
+        IMPORTANT: Agent context must be cleared even if run lookup fails,
+        to prevent stale context from persisting in the thread.
+        """
+        run = self._get_run_with_fallback(event.__class__.__name__)
+        if not run:
+            # Still clear agent context even without a run to prevent stale attribution
+            clear_current_agent_context()
+            return
+
+        # Emit the event first (while we still have context)
+        task_key = _get_task_key(event)
+        agent_key = _get_agent_key(event)
+        parent_span_id = run.get_task_parent_span(task_key=task_key, agent_key=agent_key)
+
+        trace_event = evt_from_crewai_event(
+            run, event,
+            parent_span_id=parent_span_id,
+            task_key=task_key,
+        )
+        trace_event["status"] = status
+
+        if task_key:
+            trace_event["attrs_compact"]["task_key"] = task_key
+        if run.has_concurrent_tasks():
+            trace_event["attrs_compact"]["concurrent_mode"] = True
+
+        run.emit(trace_event)
+
+        # Clear agent context for this thread after emitting the event
+        clear_current_agent_context()
+
+    # =========================================================================
+    # Generic Event Handler (for tool, LLM events)
     # =========================================================================
 
     def _handle_event(self, event: Any) -> None:
@@ -510,6 +596,9 @@ class ArzuleCrewAIListener:
 
         For concurrent execution, this determines the correct parent span
         by looking up the task associated with the event's agent.
+        
+        For LLM and tool events that don't have agent context from CrewAI,
+        injects the current thread-local agent so events are properly attributed.
         """
         run = self._get_run_with_fallback(event.__class__.__name__)
         if not run:
@@ -527,6 +616,14 @@ class ArzuleCrewAIListener:
             parent_span_id=parent_span_id,
             task_key=task_key,
         )
+
+        # Inject current agent if event doesn't have one
+        # This handles LLM/tool events where CrewAI doesn't propagate agent context
+        if trace_event.get("agent") is None:
+            current_agent = run.get_current_agent()
+            if current_agent:
+                trace_event["agent"] = current_agent
+                trace_event["attrs_compact"]["agent_injected"] = True
 
         # Add concurrency context to attrs for debugging
         if task_key:
