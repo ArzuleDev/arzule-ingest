@@ -41,9 +41,16 @@ def _extract_task_info(task: Any) -> tuple[Optional[str], Optional[str]]:
     return task_id, description
 
 
-def _base(run: "ArzuleRun", *, span_id: Optional[str], parent_span_id: Optional[str]) -> dict[str, Any]:
-    """Build base event fields."""
-    return {
+def _base(
+    run: "ArzuleRun",
+    *,
+    span_id: Optional[str],
+    parent_span_id: Optional[str],
+    async_id: Optional[str] = None,
+    causal_parents: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """Build base event fields with optional async support."""
+    event = {
         "schema_version": "trace_event.v0_1",
         "run_id": run.run_id,
         "tenant_id": run.tenant_id,
@@ -57,6 +64,14 @@ def _base(run: "ArzuleRun", *, span_id: Optional[str], parent_span_id: Optional[
         "task_id": None,
         "raw_ref": {"storage": "inline"},
     }
+    
+    # Add async fields if provided
+    if async_id:
+        event["async_id"] = async_id
+    if causal_parents:
+        event["causal_parents"] = causal_parents
+    
+    return event
 
 
 # =============================================================================
@@ -64,13 +79,21 @@ def _base(run: "ArzuleRun", *, span_id: Optional[str], parent_span_id: Optional[
 # =============================================================================
 
 
-def evt_from_crewai_event(run: "ArzuleRun", event: Any) -> dict[str, Any]:
+def evt_from_crewai_event(
+    run: "ArzuleRun",
+    event: Any,
+    *,
+    parent_span_id: Optional[str] = None,
+    task_key: Optional[str] = None,
+) -> dict[str, Any]:
     """
     Convert a CrewAI event bus event to a TraceEvent.
 
     Args:
         run: The active ArzuleRun
         event: CrewAI event object
+        parent_span_id: Optional explicit parent span (for concurrent task tracking)
+        task_key: Optional task key for correlation in concurrent mode
 
     Returns:
         TraceEvent dict
@@ -162,6 +185,7 @@ def evt_from_crewai_event(run: "ArzuleRun", event: Any) -> dict[str, Any]:
             "id": _safe_getattr(task, "id", None),
             "description": _safe_getattr(task, "description", None),
             "expected_output": _safe_getattr(task, "expected_output", None),
+            "async_execution": _safe_getattr(task, "async_execution", None),
         })
 
     # Tool info in payload/attrs
@@ -185,6 +209,21 @@ def evt_from_crewai_event(run: "ArzuleRun", event: Any) -> dict[str, Any]:
             content = str(response)
         payload["response"] = truncate_string(str(content), 2000)
 
+    # Determine parent span:
+    # 1. Use explicit parent_span_id if provided (concurrent mode)
+    # 2. Try task-based lookup if task_key provided
+    # 3. Fall back to legacy sequential mode
+    effective_parent_span = parent_span_id
+    if effective_parent_span is None and task_key:
+        effective_parent_span = run.get_task_parent_span(task_key=task_key)
+    if effective_parent_span is None:
+        # Extract agent key for agent-based task lookup
+        agent_key = f"agent:{agent_info['role']}" if agent_info and agent_info.get('role') else None
+        if agent_key:
+            effective_parent_span = run.get_task_parent_span(agent_key=agent_key)
+    if effective_parent_span is None:
+        effective_parent_span = run.current_parent_span_id()
+
     return {
         "schema_version": "trace_event.v0_1",
         "run_id": run.run_id,
@@ -192,7 +231,7 @@ def evt_from_crewai_event(run: "ArzuleRun", event: Any) -> dict[str, Any]:
         "project_id": run.project_id,
         "trace_id": run.trace_id,
         "span_id": new_span_id(),
-        "parent_span_id": run.current_parent_span_id(),
+        "parent_span_id": effective_parent_span,
         "seq": run.next_seq(),
         "ts": run.now(),
         "workstream_id": None,
@@ -414,4 +453,104 @@ def _truncate_messages(messages: Any, max_messages: int = 10) -> list[dict[str, 
         result.append({"_truncated": f"{len(messages) - max_messages} more messages"})
 
     return result
+
+
+# =============================================================================
+# Async Boundary Events (for async_execution=True tasks)
+# =============================================================================
+
+
+def evt_async_spawn(
+    run: "ArzuleRun",
+    task_key: str,
+    async_id: str,
+    parent_span_id: Optional[str],
+    task_description: Optional[str] = None,
+    agent_info: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """
+    Create async.spawn event when parent spawns an async child task.
+
+    The causal_parents links this spawn to the spawning context.
+
+    Args:
+        run: The active ArzuleRun
+        task_key: Unique identifier for the async task
+        async_id: The async correlation ID
+        parent_span_id: The parent span that spawned this async task
+        task_description: Optional task description
+        agent_info: Optional agent info dict
+
+    Returns:
+        TraceEvent dict
+    """
+    span_id = new_span_id()
+    causal_parents = [parent_span_id] if parent_span_id else []
+
+    return {
+        **_base(
+            run,
+            span_id=span_id,
+            parent_span_id=parent_span_id,
+            async_id=async_id,
+            causal_parents=causal_parents,
+        ),
+        "agent": agent_info,
+        "event_type": "async.spawn",
+        "status": "ok",
+        "summary": f"async task spawned: {task_key}",
+        "attrs_compact": {
+            "async_id": async_id,
+            "task_key": task_key,
+            "causal_parents": causal_parents,
+        },
+        "payload": {
+            "task_description": truncate_string(task_description, 500) if task_description else None,
+        },
+    }
+
+
+def evt_async_join(
+    run: "ArzuleRun",
+    task_key: str,
+    async_id: str,
+    parent_span_id: Optional[str],
+    status: str = "ok",
+    result_summary: Optional[str] = None,
+    agent_info: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """
+    Create async.join event when an async context completes.
+
+    Args:
+        run: The active ArzuleRun
+        task_key: The task identifier
+        async_id: The async correlation ID
+        parent_span_id: The parent span
+        status: Completion status (ok or error)
+        result_summary: Optional summary of the result
+        agent_info: Optional agent info dict
+
+    Returns:
+        TraceEvent dict
+    """
+    span_id = new_span_id()
+
+    return {
+        **_base(
+            run,
+            span_id=span_id,
+            parent_span_id=parent_span_id,
+            async_id=async_id,
+        ),
+        "agent": agent_info,
+        "event_type": "async.join",
+        "status": status,
+        "summary": result_summary or f"async task completed: {task_key}",
+        "attrs_compact": {
+            "async_id": async_id,
+            "task_key": task_key,
+        },
+        "payload": {},
+    }
 

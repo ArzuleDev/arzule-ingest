@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 # Pattern to extract handoff keys from task descriptions
 HANDOFF_RE = re.compile(r"\[arzule_handoff:([0-9a-f-]{36})\]")
 
-# Tool names that indicate delegation (CrewAI coworker tools)
+# Exact tool names that indicate delegation (CrewAI standard tools)
 DELEGATION_TOOL_NAMES = {
     "delegate_work_to_coworker",
     "ask_question_to_coworker",
@@ -20,13 +20,68 @@ DELEGATION_TOOL_NAMES = {
     "Ask question to coworker",
 }
 
+# Patterns that indicate delegation/handoff when found in tool names
+# These cover common multi-agent patterns across frameworks
+DELEGATION_PATTERNS = [
+    # Standard delegation verbs
+    "delegate",
+    "handoff",
+    "hand_off",
+    "handover",
+    "hand_over",
+    "transfer",
+    # Routing patterns
+    "route_to",
+    "send_to",
+    "forward_to",
+    "pass_to",
+    # Agent interaction patterns
+    "coworker",
+    "co_worker",
+    "colleague",
+    "teammate",
+    # Role-based patterns
+    "specialist",
+    "expert",
+    "assistant",
+    # Consultation patterns
+    "consult",
+    "ask_",
+    "query_",
+    # Assignment patterns
+    "assign_to",
+    "dispatch_to",
+    # Call patterns (LangGraph style)
+    "call_agent",
+    "invoke_agent",
+]
+
 
 def is_delegation_tool(tool_name: Optional[str]) -> bool:
-    """Check if a tool name indicates delegation."""
+    """
+    Check if a tool name indicates agent-to-agent delegation.
+    
+    Matches:
+    - Exact CrewAI tool names
+    - Pattern-based detection for common delegation tools
+    - Works across CrewAI, LangGraph, custom implementations
+    """
     if not tool_name:
         return False
+    
     name = tool_name.strip()
-    return name in DELEGATION_TOOL_NAMES or "coworker" in name.lower()
+    
+    # Check exact matches first
+    if name in DELEGATION_TOOL_NAMES:
+        return True
+    
+    # Check patterns (case-insensitive)
+    name_lower = name.lower()
+    for pattern in DELEGATION_PATTERNS:
+        if pattern in name_lower:
+            return True
+    
+    return False
 
 
 def maybe_inject_handoff_key(run: "ArzuleRun", context: Any) -> Optional[str]:

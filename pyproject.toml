@@ -1,10 +1,10 @@
 [project]
 name = "arzule-ingest"
-version = "0.3.1"
+version = "0.5.1"
 description = "Lightweight SDK for capturing multi-agent traces and sending to Arzule"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { file = "LICENSE" }
 authors = [{ name = "Arzule" }]
 keywords = ["observability", "tracing", "multi-agent", "crewai", "langchain", "langgraph", "autogen", "agents", "llm"]
 classifiers = [
@@ -18,38 +18,18 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 
-# Core dependencies - minimal footprint
+# All dependencies included by default
 dependencies = [
     "httpx>=0.27.0",
     "pydantic>=2.0.0",
+    "crewai>=0.80.0",
+    "langchain>=0.2.0",
+    "langchain-core>=0.2.0",
+    "pyautogen>=0.2.0,<0.3.0",
+    "cryptography>=42.0.0",
 ]
 
 [project.optional-dependencies]
-# CrewAI integration (optional - only needed if using CrewAI)
-crewai = [
-    "crewai>=0.80.0",
-]
-# LangChain integration (optional - only needed if using LangChain)
-langchain = [
-    "langchain>=0.2.0",
-    "langchain-core>=0.2.0",
-]
-# AutoGen integration (optional - only needed if using Microsoft AutoGen)
-autogen = [
-    "pyautogen>=0.2.0,<0.3.0",
-]
-# SOC2: Encryption at rest requires cryptography
-soc2 = [
-    "cryptography>=42.0.0",
-]
-# Full install with all optional deps
-all = [
-    "crewai>=0.80.0",
-    "langchain>=0.2.0",
-    "langchain-core>=0.2.0",
-    "pyautogen>=0.2.0,<0.3.0",
-    "cryptography>=42.0.0",
-]
 # Development dependencies (not published)
 dev = [
     "pytest>=8.0.0",

@@ -12,15 +12,41 @@ if TYPE_CHECKING:
 # Pattern to extract handoff keys from text
 HANDOFF_RE = re.compile(r"\[arzule_handoff:([0-9a-f-]{36})\]")
 
-# Tool names that indicate agent-to-agent delegation in LangGraph
-HANDOFF_TOOL_PATTERNS = {
-    "transfer_to_",
-    "handoff_to_",
-    "delegate_to_",
-    "route_to_",
-    "send_to_agent",
+# Patterns that indicate agent-to-agent delegation in LangGraph
+# These cover common multi-agent patterns across frameworks
+HANDOFF_TOOL_PATTERNS = [
+    # Standard delegation verbs
+    "delegate",
+    "handoff",
+    "hand_off",
+    "handover",
+    "hand_over",
+    "transfer",
+    # Routing patterns
+    "route_to",
+    "send_to",
+    "forward_to",
+    "pass_to",
+    # Agent interaction patterns
+    "coworker",
+    "co_worker",
+    "colleague",
+    "teammate",
+    # Role-based patterns
+    "specialist",
+    "expert",
+    "assistant",
+    # Consultation patterns
+    "consult",
+    "ask_",
+    "query_",
+    # Assignment patterns
+    "assign_to",
+    "dispatch_to",
+    # Call patterns
     "call_agent",
-}
+    "invoke_agent",
+]
 
 
 def is_handoff_tool(tool_name: Optional[str]) -> bool:
@@ -50,9 +76,41 @@ def extract_target_agent_from_tool(tool_name: str) -> Optional[str]:
     Examples:
         transfer_to_researcher -> researcher
         handoff_to_writer -> writer
+        delegate_to_specialist -> specialist
+        consult_expert -> expert
     """
-    for pattern in ["transfer_to_", "handoff_to_", "delegate_to_", "route_to_"]:
-        if tool_name.lower().startswith(pattern):
+    # Patterns with _to_ suffix that commonly have agent names after
+    to_patterns = [
+        "transfer_to_",
+        "handoff_to_",
+        "hand_off_to_",
+        "handover_to_",
+        "hand_over_to_",
+        "delegate_to_",
+        "route_to_",
+        "send_to_",
+        "forward_to_",
+        "pass_to_",
+        "assign_to_",
+        "dispatch_to_",
+    ]
+    
+    name_lower = tool_name.lower()
+    for pattern in to_patterns:
+        if name_lower.startswith(pattern):
+            return tool_name[len(pattern):]
+    
+    # Patterns with _ suffix (e.g., consult_expert)
+    action_patterns = [
+        "consult_",
+        "ask_",
+        "query_",
+        "call_",
+        "invoke_",
+    ]
+    
+    for pattern in action_patterns:
+        if name_lower.startswith(pattern):
             return tool_name[len(pattern):]
 
     return None
@@ -238,4 +296,5 @@ def emit_handoff_complete(
         "payload": {},
         "raw_ref": {"storage": "inline"},
     })
+
 

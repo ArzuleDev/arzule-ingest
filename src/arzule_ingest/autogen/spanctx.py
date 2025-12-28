@@ -91,3 +91,4 @@ def get_message_span_id() -> str:
     """Generate a new span ID for a message within a conversation."""
     return new_span_id()
 
+

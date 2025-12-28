@@ -10,16 +10,7 @@ Lightweight SDK for capturing multi-agent traces and sending them to Arzule.
 ## Installation
 
 ```bash
-# Core SDK only (no framework dependencies)
 pip install arzule-ingest
-
-# With specific framework integrations
-pip install arzule-ingest[crewai]
-pip install arzule-ingest[langchain]
-pip install arzule-ingest[autogen]
-
-# All integrations
-pip install arzule-ingest[all]
 ```
 
 ## Quick Start

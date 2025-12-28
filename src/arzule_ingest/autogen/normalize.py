@@ -557,3 +557,4 @@ def _truncate_messages(messages: Any, max_messages: int = 10) -> list[dict[str, 
 
     return result
 
+

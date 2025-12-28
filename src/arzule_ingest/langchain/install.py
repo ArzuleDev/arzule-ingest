@@ -91,3 +91,4 @@ def get_handler() -> Optional["ArzuleLangChainHandler"]:
     """Get the global handler instance, if instrumented."""
     return _handler_instance
 
+

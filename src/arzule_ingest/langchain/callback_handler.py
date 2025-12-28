@@ -1,11 +1,18 @@
-"""LangChain callback handler for Arzule observability."""
+"""LangChain callback handler for Arzule observability.
+
+Thread Safety:
+- Caches run_id for fallback when ContextVar fails in spawned threads
+- Uses global registry lookup when ContextVar returns None
+"""
 
 from __future__ import annotations
 
 import sys
+import threading
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 from uuid import UUID
 
+from ..logger import log_event_dropped
 from ..run import current_run
 from ..ids import new_span_id
 from .normalize import (
@@ -30,6 +37,7 @@ if TYPE_CHECKING:
     from langchain_core.agents import AgentAction, AgentFinish
     from langchain_core.documents import Document
     from langchain_core.outputs import LLMResult
+    from ..run import ArzuleRun
 
 # Try to import BaseCallbackHandler, fall back to standalone class
 try:
@@ -82,6 +90,61 @@ class ArzuleLangChainHandler(_BASE_CLASS):
 
         # Track run_id -> span_id mapping for correlating start/end
         self._run_spans: Dict[str, str] = {}
+        
+        # Cached run_id for thread fallback when ContextVar fails
+        self._cached_run_id: Optional[str] = None
+        self._cached_run_id_lock = threading.Lock()
+
+    # =========================================================================
+    # Run Context Fallback (for spawned threads)
+    # =========================================================================
+
+    def _cache_run_id(self, run_id: str) -> None:
+        """Cache the run_id for thread-safe fallback lookup."""
+        with self._cached_run_id_lock:
+            self._cached_run_id = run_id
+
+    def _clear_cached_run_id(self) -> None:
+        """Clear the cached run_id."""
+        with self._cached_run_id_lock:
+            self._cached_run_id = None
+
+    def _get_cached_run_id(self) -> Optional[str]:
+        """Get the cached run_id (thread-safe)."""
+        with self._cached_run_id_lock:
+            return self._cached_run_id
+
+    def _get_run_with_fallback(self, callback_name: str) -> Optional["ArzuleRun"]:
+        """Get run from ContextVar, falling back to cached run_id.
+        
+        Args:
+            callback_name: Name of the callback (for logging if dropped)
+            
+        Returns:
+            The ArzuleRun instance, or None if not recoverable
+        """
+        # Try ContextVar first
+        run = current_run()
+        if run:
+            # Update cache when we have a valid run
+            self._cache_run_id(run.run_id)
+            return run
+        
+        # Fallback: try global registry with cached run_id
+        cached_id = self._get_cached_run_id()
+        if cached_id:
+            run = current_run(run_id_hint=cached_id)
+            if run:
+                return run
+        
+        # Log the drop (only if we had a cached_id, meaning we were expecting a run)
+        if cached_id:
+            log_event_dropped(
+                reason="no_active_run_and_fallback_failed",
+                event_class=f"langchain.{callback_name}",
+                extra={"cached_run_id": cached_id}
+            )
+        return None
 
     def _get_run_key(self, run_id: UUID) -> str:
         """Convert UUID to string key."""
@@ -120,7 +183,7 @@ class ArzuleLangChainHandler(_BASE_CLASS):
         if not self.enable_llm:
             return
 
-        run = current_run()
+        run = self._get_run_with_fallback("on_llm_start")
         if not run:
             return
 
@@ -162,7 +225,7 @@ class ArzuleLangChainHandler(_BASE_CLASS):
         if not self.enable_llm:
             return
 
-        run = current_run()
+        run = self._get_run_with_fallback("on_llm_end")
         if not run:
             return
 
@@ -189,7 +252,7 @@ class ArzuleLangChainHandler(_BASE_CLASS):
         if not self.enable_llm:
             return
 
-        run = current_run()
+        run = self._get_run_with_fallback("on_llm_error")
         if not run:
             return
 
@@ -223,7 +286,7 @@ class ArzuleLangChainHandler(_BASE_CLASS):
         if not self.enable_chain:
             return
 
-        run = current_run()
+        run = self._get_run_with_fallback("on_chain_start")
         if not run:
             return
 
@@ -256,7 +319,7 @@ class ArzuleLangChainHandler(_BASE_CLASS):
         if not self.enable_chain:
             return
 
-        run = current_run()
+        run = self._get_run_with_fallback("on_chain_end")
         if not run:
             return
 
@@ -286,7 +349,7 @@ class ArzuleLangChainHandler(_BASE_CLASS):
         if not self.enable_chain:
             return
 
-        run = current_run()
+        run = self._get_run_with_fallback("on_chain_error")
         if not run:
             return
 
@@ -323,7 +386,7 @@ class ArzuleLangChainHandler(_BASE_CLASS):
         if not self.enable_tool:
             return
 
-        run = current_run()
+        run = self._get_run_with_fallback("on_tool_start")
         if not run:
             return
 
@@ -353,7 +416,7 @@ class ArzuleLangChainHandler(_BASE_CLASS):
         if not self.enable_tool:
             return
 
-        run = current_run()
+        run = self._get_run_with_fallback("on_tool_end")
         if not run:
             return
 
@@ -380,7 +443,7 @@ class ArzuleLangChainHandler(_BASE_CLASS):
         if not self.enable_tool:
             return
 
-        run = current_run()
+        run = self._get_run_with_fallback("on_tool_error")
         if not run:
             return
 
@@ -413,7 +476,7 @@ class ArzuleLangChainHandler(_BASE_CLASS):
         if not self.enable_agent:
             return
 
-        run = current_run()
+        run = self._get_run_with_fallback("on_agent_action")
         if not run:
             return
 
@@ -447,7 +510,7 @@ class ArzuleLangChainHandler(_BASE_CLASS):
         if not self.enable_agent:
             return
 
-        run = current_run()
+        run = self._get_run_with_fallback("on_agent_finish")
         if not run:
             return
 
@@ -483,7 +546,7 @@ class ArzuleLangChainHandler(_BASE_CLASS):
         if not self.enable_retriever:
             return
 
-        run = current_run()
+        run = self._get_run_with_fallback("on_retriever_start")
         if not run:
             return
 
@@ -513,7 +576,7 @@ class ArzuleLangChainHandler(_BASE_CLASS):
         if not self.enable_retriever:
             return
 
-        run = current_run()
+        run = self._get_run_with_fallback("on_retriever_end")
         if not run:
             return
 
@@ -540,7 +603,7 @@ class ArzuleLangChainHandler(_BASE_CLASS):
         if not self.enable_retriever:
             return
 
-        run = current_run()
+        run = self._get_run_with_fallback("on_retriever_error")
         if not run:
             return
 

@@ -6,15 +6,21 @@ This module patches AutoGen's ConversableAgent class methods to capture:
 - Tool/function executions
 - Code executions
 - Conversation lifecycle
+
+Thread Safety:
+- Caches run_id for fallback when ContextVar fails in spawned threads
+- Uses global registry lookup when ContextVar returns None
 """
 
 from __future__ import annotations
 
 import functools
 import sys
+import threading
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
 from ..ids import new_span_id
+from ..logger import log_event_dropped
 from ..run import current_run
 from .normalize import (
     evt_message_send,
@@ -35,13 +41,73 @@ from .spanctx import (
 )
 
 if TYPE_CHECKING:
-    pass
+    from ..run import ArzuleRun
 
 # Store original methods for restoration
 _original_methods: dict[str, Any] = {}
 
 # Track conversation message counts
 _conversation_message_counts: dict[str, int] = {}
+
+# =============================================================================
+# Cached run_id for thread fallback (module-level)
+# =============================================================================
+
+_cached_run_id: Optional[str] = None
+_cached_run_id_lock = threading.Lock()
+
+
+def _cache_run_id(run_id: str) -> None:
+    """Cache the run_id for thread-safe fallback lookup."""
+    global _cached_run_id
+    with _cached_run_id_lock:
+        _cached_run_id = run_id
+
+
+def _clear_cached_run_id() -> None:
+    """Clear the cached run_id."""
+    global _cached_run_id
+    with _cached_run_id_lock:
+        _cached_run_id = None
+
+
+def _get_cached_run_id() -> Optional[str]:
+    """Get the cached run_id (thread-safe)."""
+    with _cached_run_id_lock:
+        return _cached_run_id
+
+
+def _get_run_with_fallback(hook_name: str) -> Optional["ArzuleRun"]:
+    """Get run from ContextVar, falling back to cached run_id.
+    
+    Args:
+        hook_name: Name of the hook (for logging if dropped)
+        
+    Returns:
+        The ArzuleRun instance, or None if not recoverable
+    """
+    # Try ContextVar first
+    run = current_run()
+    if run:
+        # Update cache when we have a valid run
+        _cache_run_id(run.run_id)
+        return run
+    
+    # Fallback: try global registry with cached run_id
+    cached_id = _get_cached_run_id()
+    if cached_id:
+        run = current_run(run_id_hint=cached_id)
+        if run:
+            return run
+    
+    # Log the drop (only if we had a cached_id, meaning we were expecting a run)
+    if cached_id:
+        log_event_dropped(
+            reason="no_active_run_and_fallback_failed",
+            event_class=f"autogen.{hook_name}",
+            extra={"cached_run_id": cached_id}
+        )
+    return None
 
 
 def _get_agent_name(agent: Any) -> str:
@@ -71,7 +137,7 @@ def _patched_send(
         silent: bool = False,
         **kwargs,
     ):
-        run = current_run()
+        run = _get_run_with_fallback("send")
         
         if run:
             try:
@@ -137,7 +203,7 @@ def _patched_receive(
         silent: bool = False,
         **kwargs,
     ):
-        run = current_run()
+        run = _get_run_with_fallback("receive")
         
         if run:
             try:
@@ -175,7 +241,7 @@ def _patched_generate_oai_reply(
     
     @functools.wraps(original_generate)
     def wrapper(self, messages: Optional[list] = None, sender: Any = None, config: Any = None, **kwargs):
-        run = current_run()
+        run = _get_run_with_fallback("generate_oai_reply")
         
         if not run:
             return original_generate(self, messages, sender, config, **kwargs)
@@ -250,7 +316,7 @@ def _patched_execute_function(
     
     @functools.wraps(original_execute)
     def wrapper(self, func_call: dict, **kwargs):
-        run = current_run()
+        run = _get_run_with_fallback("execute_function")
         
         if not run:
             return original_execute(self, func_call, **kwargs)
@@ -320,7 +386,7 @@ def _patched_execute_code_blocks(
     
     @functools.wraps(original_execute)
     def wrapper(self, code_blocks: list, **kwargs):
-        run = current_run()
+        run = _get_run_with_fallback("execute_code_blocks")
         
         if not run:
             return original_execute(self, code_blocks, **kwargs)
@@ -375,7 +441,7 @@ def _patched_initiate_chat(
     
     @functools.wraps(original_initiate)
     def wrapper(self, recipient: Any, *args, **kwargs):
-        run = current_run()
+        run = _get_run_with_fallback("initiate_chat")
         
         # Extract message for logging (may be positional or keyword)
         message = kwargs.get("message")
@@ -476,7 +542,7 @@ def _patched_async_send(
         silent: bool = False,
         **kwargs,
     ):
-        run = current_run()
+        run = _get_run_with_fallback("a_send")
         
         if run:
             try:
@@ -533,7 +599,7 @@ def _patched_async_receive(
         silent: bool = False,
         **kwargs,
     ):
-        run = current_run()
+        run = _get_run_with_fallback("a_receive")
         
         if run:
             try:
@@ -563,7 +629,7 @@ def _patched_async_initiate_chat(
     
     @functools.wraps(original_initiate)
     async def wrapper(self, recipient: Any, *args, **kwargs):
-        run = current_run()
+        run = _get_run_with_fallback("a_initiate_chat")
         
         # Extract message for logging
         message = kwargs.get("message")
