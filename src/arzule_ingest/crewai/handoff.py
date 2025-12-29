@@ -2,12 +2,53 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import uuid
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from ..run import ArzuleRun
+
+
+def _compute_payload_hash(payload: Any) -> Optional[str]:
+    """
+    Compute a stable hash of handoff payload for contract drift detection.
+    
+    Returns a 12-character hex hash that can be used to identify
+    changes in payload structure over time.
+    """
+    if payload is None:
+        return None
+    
+    try:
+        if isinstance(payload, dict):
+            serialized = json.dumps(payload, sort_keys=True, default=str)
+        else:
+            serialized = str(payload)
+        
+        return hashlib.md5(serialized.encode()).hexdigest()[:12]
+    except Exception:
+        return None
+
+
+def _extract_payload_keys(payload: Any, max_keys: int = 15) -> list[str]:
+    """
+    Extract top-level keys from handoff payload for schema analysis.
+    
+    Returns sorted list of keys (capped at max_keys) for detecting
+    contract drift across handoffs between the same agent pairs.
+    """
+    if not isinstance(payload, dict):
+        return []
+    
+    try:
+        # Get sorted keys, excluding internal arzule metadata
+        keys = [k for k in payload.keys() if k != "arzule"]
+        return sorted(keys)[:max_keys]
+    except Exception:
+        return []
 
 # Pattern to extract handoff keys from task descriptions
 HANDOFF_RE = re.compile(r"\[arzule_handoff:([0-9a-f-]{36})\]")
@@ -157,6 +198,23 @@ def maybe_emit_handoff_proposed(run: "ArzuleRun", context: Any, span_id: Optiona
     # Try to extract target agent from tool input
     to_coworker = tool_input.get("coworker") or tool_input.get("to") or tool_input.get("agent")
 
+    # Compute detection fields for forensics (contract drift detection)
+    payload_hash = _compute_payload_hash(tool_input)
+    payload_keys = _extract_payload_keys(tool_input)
+
+    attrs = {
+        "handoff_key": handoff_key,
+        "from_agent_role": getattr(agent, "role", None) if agent else None,
+        "to_coworker": to_coworker,
+        "tool_name": tool_name,
+    }
+    
+    # Add detection fields if available
+    if payload_hash:
+        attrs["payload_hash"] = payload_hash
+    if payload_keys:
+        attrs["payload_keys"] = payload_keys
+
     run.emit({
         "schema_version": "trace_event.v0_1",
         "run_id": run.run_id,
@@ -174,12 +232,7 @@ def maybe_emit_handoff_proposed(run: "ArzuleRun", context: Any, span_id: Optiona
         "event_type": "handoff.proposed",
         "status": "ok",
         "summary": f"handoff proposed to {to_coworker or 'coworker'}",
-        "attrs_compact": {
-            "handoff_key": handoff_key,
-            "from_agent_role": getattr(agent, "role", None) if agent else None,
-            "to_coworker": to_coworker,
-            "tool_name": tool_name,
-        },
+        "attrs_compact": attrs,
         "payload": {"tool_input": tool_input},
         "raw_ref": {"storage": "inline"},
     })
@@ -256,6 +309,7 @@ def emit_handoff_complete(
     span_id: Optional[str] = None,
     status: str = "ok",
     result_summary: Optional[str] = None,
+    result_payload: Optional[Any] = None,
 ) -> None:
     """
     Emit handoff.complete event when delegated task finishes.
@@ -268,8 +322,36 @@ def emit_handoff_complete(
         span_id: The current span ID
         status: Completion status
         result_summary: Brief summary of result
+        result_payload: Full result data for semantic analysis
     """
     pending = run._handoff_pending.pop(handoff_key, {})
+    
+    # Build payload for semantic drift detection
+    # Include both the original request (from pending) and the result
+    payload = {}
+    
+    # Include original delegation request for comparison
+    tool_input = pending.get("tool_input", {})
+    if tool_input:
+        payload["delegation_request"] = {
+            "task": tool_input.get("task"),
+            "context": tool_input.get("context"),
+            "coworker": tool_input.get("coworker"),
+        }
+    
+    # Include the result
+    if result_payload is not None:
+        # Truncate if too large
+        result_str = str(result_payload)
+        if len(result_str) > 2000:
+            payload["result"] = result_str[:2000] + "..."
+        else:
+            payload["result"] = result_str
+    elif result_summary:
+        payload["result"] = result_summary
+    
+    # Compute result hash for drift detection
+    result_hash = _compute_payload_hash(result_payload or result_summary)
 
     run.emit({
         "schema_version": "trace_event.v0_1",
@@ -293,8 +375,9 @@ def emit_handoff_complete(
             "handoff_key": handoff_key,
             "from_agent_role": pending.get("from_role"),
             "to_agent_role": agent_role,
+            "result_hash": result_hash,
         },
-        "payload": {},
+        "payload": payload,
         "raw_ref": {"storage": "inline"},
     })
 

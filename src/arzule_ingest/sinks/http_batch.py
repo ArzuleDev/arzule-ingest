@@ -138,9 +138,19 @@ class HttpBatchSink(TelemetrySink):
             import sys
 
             error_type = type(e).__name__
+            # Include HTTP status code if available (safe to log)
+            status_info = ""
+            if hasattr(e, "response") and e.response is not None:
+                status_code = getattr(e.response, "status_code", None)
+                if status_code:
+                    status_info = f", status={status_code}"
+                    # For 401/403, hint at auth issue
+                    if status_code in (401, 403):
+                        status_info += " (check API key)"
+            
             # Only include safe metadata, never payload contents
             print(
-                f"[arzule] Failed to send batch: {error_type} "
+                f"[arzule] Failed to send batch: {error_type}{status_info} "
                 f"(batch_size={len(batch)}, endpoint={self._safe_endpoint})",
                 file=sys.stderr,
             )

@@ -5,13 +5,14 @@ from __future__ import annotations
 import atexit
 import os
 import sys
+import threading
 from typing import Optional
 
-from .run_context import ArzuleRun, current_run
+from .run import ArzuleRun, current_run
 from .config import ArzuleConfig
 from .audit import AuditLogger, audit_log
 
-__version__ = "0.5.1"
+__version__ = "0.5.12"
 __all__ = [
     "ArzuleRun",
     "current_run",
@@ -19,6 +20,7 @@ __all__ = [
     "AuditLogger",
     "audit_log",
     "init",
+    "new_run",
     "shutdown",
 ]
 
@@ -27,6 +29,7 @@ _initialized = False
 _global_sink: Optional["TelemetrySink"] = None
 _global_run: Optional[ArzuleRun] = None
 _config: Optional[dict] = None
+_run_lock = threading.Lock()  # Thread-safe lock for new_run()
 
 # Default ingest URL
 DEFAULT_INGEST_URL = "https://uuczh0e8g5.execute-api.us-east-1.amazonaws.com/ingest"
@@ -176,6 +179,50 @@ def init(
     print(f"[arzule] Initialized. Run ID: {_global_run.run_id}", file=sys.stderr)
 
     return _config
+
+
+def new_run() -> Optional[str]:
+    """
+    Start a new run, closing the previous one if any.
+    
+    This is called automatically when a new CrewAI crew kicks off, ensuring
+    each crew execution gets its own run with sequence numbers starting at 1.
+    
+    Returns:
+        The new run_id, or None if not initialized.
+    """
+    global _global_run, _config
+    
+    if not _initialized or not _global_sink:
+        return None
+    
+    with _run_lock:
+        # Close the previous run if any
+        if _global_run:
+            try:
+                _global_run.__exit__(None, None, None)
+            except Exception:
+                pass
+        
+        # Create a new run with the same config
+        tenant_id = _config.get("tenant_id") if _config else None
+        project_id = _config.get("project_id") if _config else None
+        
+        if not tenant_id or not project_id:
+            return None
+        
+        _global_run = ArzuleRun(
+            tenant_id=tenant_id,
+            project_id=project_id,
+            sink=_global_sink,
+        )
+        _global_run.__enter__()
+        
+        # Update config with new run_id
+        if _config:
+            _config["run_id"] = _global_run.run_id
+        
+        return _global_run.run_id
 
 
 def shutdown() -> None:

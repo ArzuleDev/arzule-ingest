@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import TYPE_CHECKING, Any, Optional
 
 from ..ids import new_span_id
@@ -17,6 +19,46 @@ def _safe_getattr(obj: Any, attr: str, default: Any = None) -> Any:
         return getattr(obj, attr, default)
     except Exception:
         return default
+
+
+def _compute_input_hash(tool_input: Any) -> Optional[str]:
+    """
+    Compute a stable hash of tool input for repetition detection.
+    
+    Returns a 12-character hex hash that can be used to identify
+    duplicate tool calls with the same input.
+    """
+    if tool_input is None:
+        return None
+    
+    try:
+        # Serialize with sorted keys for deterministic output
+        if isinstance(tool_input, dict):
+            serialized = json.dumps(tool_input, sort_keys=True, default=str)
+        else:
+            serialized = str(tool_input)
+        
+        return hashlib.md5(serialized.encode()).hexdigest()[:12]
+    except Exception:
+        return None
+
+
+def _extract_input_keys(tool_input: Any, max_keys: int = 10) -> list[str]:
+    """
+    Extract top-level keys from tool input for schema analysis.
+    
+    Returns sorted list of keys (capped at max_keys) for detecting
+    schema drift across tool calls.
+    """
+    if not isinstance(tool_input, dict):
+        return []
+    
+    try:
+        # Get sorted keys, excluding internal arzule metadata
+        keys = [k for k in tool_input.keys() if k != "arzule"]
+        return sorted(keys)[:max_keys]
+    except Exception:
+        return []
 
 
 def _extract_agent_info(agent: Any) -> Optional[dict[str, Any]]:
@@ -209,6 +251,23 @@ def evt_from_crewai_event(
         # Flow events
         "FlowStartedEvent": "flow.start",
         "FlowFinishedEvent": "flow.complete",
+        # Memory events
+        "MemoryQueryStartedEvent": "memory.query.start",
+        "MemoryQueryCompletedEvent": "memory.query.end",
+        "MemoryQueryFailedEvent": "memory.query.error",
+        "MemorySaveStartedEvent": "memory.save.start",
+        "MemorySaveCompletedEvent": "memory.save.end",
+        "MemorySaveFailedEvent": "memory.save.error",
+        # Knowledge events
+        "KnowledgeQueryStartedEvent": "knowledge.query.start",
+        "KnowledgeQueryCompletedEvent": "knowledge.query.end",
+        "KnowledgeQueryFailedEvent": "knowledge.query.error",
+        "KnowledgeRetrievalStartedEvent": "knowledge.retrieval.start",
+        "KnowledgeRetrievalCompletedEvent": "knowledge.retrieval.end",
+        # Reasoning events
+        "AgentReasoningStartedEvent": "agent.reasoning.start",
+        "AgentReasoningCompletedEvent": "agent.reasoning.end",
+        "AgentReasoningFailedEvent": "agent.reasoning.error",
     }
 
     event_type = event_type_map.get(event_class, f"crewai.{event_class}")
@@ -227,8 +286,11 @@ def evt_from_crewai_event(
     task_id, task_desc = _extract_task_info(task)
 
     # Tool info for tool events
+    # CrewAI uses "tool_args" for tool input, fall back to "tool_input" for compatibility
     tool_name = _safe_getattr(event, "tool_name", None)
-    tool_input = _safe_getattr(event, "tool_input", None)
+    tool_input = _safe_getattr(event, "tool_args", None)
+    if tool_input is None:
+        tool_input = _safe_getattr(event, "tool_input", None)
     tool_output = _safe_getattr(event, "tool_output", None) or _safe_getattr(event, "output", None)
 
     # Build summary
@@ -273,6 +335,16 @@ def evt_from_crewai_event(
     # Tool info in payload/attrs
     if tool_name:
         attrs["tool_name"] = tool_name
+        
+        # Add detection fields for forensics (tool events)
+        if tool_input is not None:
+            input_hash = _compute_input_hash(tool_input)
+            input_keys = _extract_input_keys(tool_input)
+            if input_hash:
+                attrs["tool_input_hash"] = input_hash
+            if input_keys:
+                attrs["tool_input_keys"] = input_keys
+    
     if tool_input is not None:
         payload["tool_input"] = sanitize(tool_input)
     if tool_output is not None:
@@ -362,16 +434,28 @@ def evt_tool_start(run: "ArzuleRun", context: Any, span_id: str) -> dict[str, An
         arz = tool_input.get("arzule", {})
         handoff_key = arz.get("handoff_key") if isinstance(arz, dict) else None
 
+    # Compute detection fields for forensics
+    input_hash = _compute_input_hash(tool_input)
+    input_keys = _extract_input_keys(tool_input)
+
+    attrs = {
+        "tool_name": tool_name,
+        "handoff_key": handoff_key,
+    }
+    
+    # Add detection fields if available
+    if input_hash:
+        attrs["tool_input_hash"] = input_hash
+    if input_keys:
+        attrs["tool_input_keys"] = input_keys
+
     return {
         **_base(run, span_id=span_id, parent_span_id=run.current_parent_span_id()),
         "agent": agent_info,
         "event_type": "tool.call.start",
         "status": "ok",
         "summary": f"tool call: {tool_name}",
-        "attrs_compact": {
-            "tool_name": tool_name,
-            "handoff_key": handoff_key,
-        },
+        "attrs_compact": attrs,
         "payload": {
             "tool_input": sanitize(tool_input),
         },
@@ -408,6 +492,21 @@ def evt_tool_end(run: "ArzuleRun", context: Any, span_id: Optional[str]) -> dict
         arz = tool_input.get("arzule", {})
         handoff_key = arz.get("handoff_key") if isinstance(arz, dict) else None
 
+    # Compute detection fields for forensics
+    input_hash = _compute_input_hash(tool_input)
+    input_keys = _extract_input_keys(tool_input)
+
+    attrs = {
+        "tool_name": tool_name,
+        "handoff_key": handoff_key,
+    }
+    
+    # Add detection fields if available
+    if input_hash:
+        attrs["tool_input_hash"] = input_hash
+    if input_keys:
+        attrs["tool_input_keys"] = input_keys
+
     payload: dict[str, Any] = {
         "tool_input": sanitize(tool_input),
     }
@@ -422,10 +521,7 @@ def evt_tool_end(run: "ArzuleRun", context: Any, span_id: Optional[str]) -> dict
         "event_type": "tool.call.end",
         "status": status,
         "summary": f"tool result: {tool_name}",
-        "attrs_compact": {
-            "tool_name": tool_name,
-            "handoff_key": handoff_key,
-        },
+        "attrs_compact": attrs,
         "payload": payload,
     }
 
@@ -646,5 +742,192 @@ def evt_async_join(
             "task_key": task_key,
         },
         "payload": {},
+    }
+
+
+# =============================================================================
+# Flow Events (for multi-crew orchestration)
+# =============================================================================
+
+
+def evt_flow_start(
+    run: "ArzuleRun",
+    flow_name: str,
+    span_id: str,
+    parent_span_id: Optional[str],
+    inputs: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """
+    Create event for flow start.
+
+    Args:
+        run: The active ArzuleRun
+        flow_name: Name of the flow
+        span_id: The span ID for this flow
+        parent_span_id: The parent span (usually root span)
+        inputs: Optional flow inputs
+
+    Returns:
+        TraceEvent dict
+    """
+    attrs = {
+        "flow_name": flow_name,
+    }
+    
+    payload: dict[str, Any] = {}
+    if inputs:
+        payload["inputs"] = sanitize(inputs)
+
+    return {
+        **_base(run, span_id=span_id, parent_span_id=parent_span_id),
+        "agent": None,
+        "event_type": "flow.start",
+        "status": "ok",
+        "summary": f"flow started: {flow_name}",
+        "attrs_compact": attrs,
+        "payload": payload,
+    }
+
+
+def evt_flow_end(
+    run: "ArzuleRun",
+    flow_name: str,
+    span_id: str,
+    parent_span_id: Optional[str],
+    status: str = "ok",
+    result: Optional[Any] = None,
+    state: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """
+    Create event for flow completion.
+
+    Args:
+        run: The active ArzuleRun
+        flow_name: Name of the flow
+        span_id: The span ID for this event
+        parent_span_id: The parent span (flow span)
+        status: Completion status (ok or error)
+        result: Optional flow result
+        state: Optional final flow state
+
+    Returns:
+        TraceEvent dict
+    """
+    attrs = {
+        "flow_name": flow_name,
+    }
+    
+    payload: dict[str, Any] = {}
+    if result is not None:
+        payload["result"] = truncate_string(str(result), 1000)
+    if state:
+        payload["final_state"] = sanitize(state)
+
+    return {
+        **_base(run, span_id=span_id, parent_span_id=parent_span_id),
+        "agent": None,
+        "event_type": "flow.complete",
+        "status": status,
+        "summary": f"flow completed: {flow_name}",
+        "attrs_compact": attrs,
+        "payload": payload,
+    }
+
+
+def evt_method_start(
+    run: "ArzuleRun",
+    flow_name: str,
+    method_name: str,
+    span_id: str,
+    parent_span_id: Optional[str],
+    params: Optional[dict[str, Any]] = None,
+    state: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """
+    Create event for flow method execution start.
+
+    Args:
+        run: The active ArzuleRun
+        flow_name: Name of the flow
+        method_name: Name of the method being executed
+        span_id: The span ID for this method
+        parent_span_id: The parent span (flow span)
+        params: Optional method parameters
+        state: Optional current flow state
+
+    Returns:
+        TraceEvent dict
+    """
+    attrs = {
+        "flow_name": flow_name,
+        "method_name": method_name,
+    }
+    
+    payload: dict[str, Any] = {}
+    if params:
+        payload["params"] = sanitize(params)
+    if state:
+        payload["state"] = sanitize(state)
+
+    return {
+        **_base(run, span_id=span_id, parent_span_id=parent_span_id),
+        "agent": None,
+        "event_type": "flow.method.start",
+        "status": "ok",
+        "summary": f"method started: {flow_name}.{method_name}",
+        "attrs_compact": attrs,
+        "payload": payload,
+    }
+
+
+def evt_method_end(
+    run: "ArzuleRun",
+    flow_name: str,
+    method_name: str,
+    span_id: str,
+    parent_span_id: Optional[str],
+    status: str = "ok",
+    result: Optional[Any] = None,
+    state: Optional[dict[str, Any]] = None,
+    error: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Create event for flow method execution completion.
+
+    Args:
+        run: The active ArzuleRun
+        flow_name: Name of the flow
+        method_name: Name of the method that completed
+        span_id: The span ID for this event
+        parent_span_id: The parent span (method start span)
+        status: Completion status (ok or error)
+        result: Optional method result
+        state: Optional updated flow state
+        error: Optional error message if failed
+
+    Returns:
+        TraceEvent dict
+    """
+    attrs = {
+        "flow_name": flow_name,
+        "method_name": method_name,
+    }
+    
+    payload: dict[str, Any] = {}
+    if result is not None:
+        payload["result"] = truncate_string(str(result), 1000)
+    if state:
+        payload["state"] = sanitize(state)
+    if error:
+        attrs["error"] = truncate_string(error, 200)
+
+    return {
+        **_base(run, span_id=span_id, parent_span_id=parent_span_id),
+        "agent": None,
+        "event_type": "flow.method.complete" if status == "ok" else "flow.method.failed",
+        "status": status,
+        "summary": f"method {'completed' if status == 'ok' else 'failed'}: {flow_name}.{method_name}",
+        "attrs_compact": attrs,
+        "payload": payload,
     }
 

@@ -171,6 +171,42 @@ class ArzuleRun:
         """Get the crew-level span ID."""
         return self._span_manager.get_crew_span()
 
+    def clear_crew_span(self) -> None:
+        """Clear the crew-level span ID when a crew ends."""
+        self._span_manager.clear_crew_span()
+
+    # =========================================================================
+    # Flow Span Management (for multi-crew orchestration)
+    # =========================================================================
+
+    def set_flow_span(self, span_id: str) -> None:
+        """Set the flow-level span ID."""
+        self._span_manager.set_flow_span(span_id)
+
+    def get_flow_span(self) -> Optional[str]:
+        """Get the flow-level span ID."""
+        return self._span_manager.get_flow_span()
+
+    def clear_flow_span(self) -> None:
+        """Clear the flow-level span ID when a flow ends."""
+        self._span_manager.clear_flow_span()
+
+    def has_flow_context(self) -> bool:
+        """Check if we are currently inside a flow."""
+        return self._span_manager.has_flow_context()
+
+    def set_method_span(self, span_id: str) -> None:
+        """Set the current flow method span ID."""
+        self._span_manager.set_method_span(span_id)
+
+    def get_method_span(self) -> Optional[str]:
+        """Get the current flow method span ID."""
+        return self._span_manager.get_method_span()
+
+    def clear_method_span(self) -> None:
+        """Clear the method-level span ID when a method ends."""
+        self._span_manager.clear_method_span()
+
     # =========================================================================
     # Task Management (delegates to TaskManager)
     # =========================================================================
