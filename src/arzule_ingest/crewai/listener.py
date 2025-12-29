@@ -1266,3 +1266,13 @@ def get_listener() -> ArzuleCrewAIListener:
     if _listener_instance is None:
         _listener_instance = ArzuleCrewAIListener()
     return _listener_instance
+
+
+def clear_listener_cache() -> None:
+    """Clear the listener's cached run_id.
+    
+    Called by new_run() to prevent stale run_id from being used
+    when callbacks arrive from background threads.
+    """
+    if _listener_instance is not None:
+        _listener_instance._clear_cached_run_id()

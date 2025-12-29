@@ -92,3 +92,13 @@ def get_handler() -> Optional["ArzuleLangChainHandler"]:
     return _handler_instance
 
 
+def clear_handler_cache() -> None:
+    """Clear the handler's cached run_id.
+    
+    Called by new_run() to prevent stale run_id from being used
+    when callbacks arrive from background threads.
+    """
+    if _handler_instance is not None:
+        _handler_instance._clear_cached_run_id()
+
+

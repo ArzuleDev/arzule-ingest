@@ -84,8 +84,25 @@ class HttpBatchSink(TelemetrySink):
             self.flush()
 
     def write(self, event: dict[str, Any]) -> None:
-        """Buffer a trace event."""
+        """Buffer a trace event.
+        
+        If the event has a different run_id than existing buffer events,
+        the buffer is flushed first to prevent mixing runs in the same batch.
+        """
+        import sys
         with self._lock:
+            event_run_id = event.get("run_id")
+            
+            # If buffer has events from a different run, flush first
+            if self._buffer:
+                first_run_id = self._buffer[0].get("run_id")
+                if event_run_id != first_run_id:
+                    print(
+                        f"[arzule] Run boundary detected, flushing {len(self._buffer)} events from previous run",
+                        file=sys.stderr,
+                    )
+                    self._send_batch()
+            
             self._buffer.append(event)
             if len(self._buffer) >= self.batch_size:
                 self._send_batch()
@@ -102,7 +119,7 @@ class HttpBatchSink(TelemetrySink):
             return
 
         batch = self._buffer.copy()
-        self._buffer.clear()
+        # NOTE: Don't clear buffer until send succeeds - prevents losing run.end events
 
         try:
             import httpx
@@ -123,6 +140,9 @@ class HttpBatchSink(TelemetrySink):
             )
             response.raise_for_status()
 
+            # SUCCESS: Only now clear the buffer (events are safely delivered)
+            self._buffer.clear()
+
             # SOC2: Audit log the successful write
             from ..audit import audit_log
             audit_log().log_data_write(
@@ -133,27 +153,75 @@ class HttpBatchSink(TelemetrySink):
             )
 
         except Exception as e:
-            # SOC2: Sanitize error messages - don't leak payload contents
             # Log error but don't crash - telemetry should be non-blocking
             import sys
 
             error_type = type(e).__name__
-            # Include HTTP status code if available (safe to log)
             status_info = ""
+            server_error = ""
+            status_code = None
+            
+            # Try to get response info from httpx exception
             if hasattr(e, "response") and e.response is not None:
-                status_code = getattr(e.response, "status_code", None)
+                resp = e.response
+                status_code = getattr(resp, "status_code", None)
                 if status_code:
                     status_info = f", status={status_code}"
-                    # For 401/403, hint at auth issue
+                    
                     if status_code in (401, 403):
                         status_info += " (check API key)"
+                    
+                    # Extract server error message
+                    try:
+                        # httpx stores response body - try multiple ways to get it
+                        response_text = None
+                        if hasattr(resp, "text"):
+                            response_text = resp.text
+                        elif hasattr(resp, "content"):
+                            response_text = resp.content.decode("utf-8")
+                        elif hasattr(resp, "read"):
+                            response_text = resp.read().decode("utf-8")
+                        
+                        if response_text:
+                            error_data = json.loads(response_text)
+                            err_code = error_data.get("error", "")
+                            err_msg = error_data.get("message", "")
+                            server_error = f" - {err_code}: {err_msg}"
+                    except Exception as parse_err:
+                        server_error = f" - (could not parse response: {parse_err})"
             
-            # Only include safe metadata, never payload contents
+            # Always log first event info on error for debugging
+            if batch:
+                first = batch[0]
+                print(
+                    f"[arzule:debug] First event in failed batch: "
+                    f"run_id={first.get('run_id')}, tenant_id={first.get('tenant_id')}, "
+                    f"project_id={first.get('project_id')}, event_type={first.get('event_type')}, "
+                    f"span_id={first.get('span_id')}, trace_id={first.get('trace_id')}",
+                    file=sys.stderr,
+                )
+            
             print(
-                f"[arzule] Failed to send batch: {error_type}{status_info} "
+                f"[arzule] Failed to send batch: {error_type}{status_info}{server_error} "
                 f"(batch_size={len(batch)}, endpoint={self._safe_endpoint})",
                 file=sys.stderr,
             )
+            
+            # For 4xx errors (except retryable ones), clear buffer to prevent infinite loops
+            if status_code and 400 <= status_code < 500 and status_code not in (401, 403, 429):
+                self._buffer.clear()
+
+    def clear_buffer(self) -> int:
+        """
+        Clear all buffered events without sending.
+        
+        Returns the number of events that were cleared.
+        Used when starting a new run to prevent mixing events from different runs.
+        """
+        with self._lock:
+            count = len(self._buffer)
+            self._buffer.clear()
+            return count
 
     def close(self) -> None:
         """Stop the flush thread and send remaining events."""

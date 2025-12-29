@@ -12,7 +12,7 @@ from .run import ArzuleRun, current_run
 from .config import ArzuleConfig
 from .audit import AuditLogger, audit_log
 
-__version__ = "0.5.12"
+__version__ = "0.5.13"
 __all__ = [
     "ArzuleRun",
     "current_run",
@@ -118,6 +118,23 @@ def init(
             "Set them as environment variables or pass to init()."
         )
 
+    # Validate that tenant_id and project_id are valid UUIDs
+    import uuid
+    try:
+        uuid.UUID(tenant_id)
+    except ValueError:
+        raise ValueError(
+            f"ARZULE_TENANT_ID must be a valid UUID, got: {tenant_id[:50]}..."
+            if len(tenant_id) > 50 else f"ARZULE_TENANT_ID must be a valid UUID, got: {tenant_id}"
+        )
+    try:
+        uuid.UUID(project_id)
+    except ValueError:
+        raise ValueError(
+            f"ARZULE_PROJECT_ID must be a valid UUID, got: {project_id[:50]}..."
+            if len(project_id) > 50 else f"ARZULE_PROJECT_ID must be a valid UUID, got: {project_id}"
+        )
+
     # Create HTTP sink
     from .sinks.http_batch import HttpBatchSink
 
@@ -203,6 +220,29 @@ def new_run() -> Optional[str]:
                 _global_run.__exit__(None, None, None)
             except Exception:
                 pass
+        
+        # CRITICAL: Force clear the sink buffer before starting new run
+        # This prevents mixing events from different runs if flush failed
+        if _global_sink and hasattr(_global_sink, 'clear_buffer'):
+            cleared = _global_sink.clear_buffer()
+            if cleared > 0:
+                print(
+                    f"[arzule] Warning: Cleared {cleared} unflushed events from previous run",
+                    file=sys.stderr,
+                )
+        
+        # CRITICAL: Clear handler caches to prevent stale run_id being used
+        # by background threads that don't have the ContextVar set
+        try:
+            from .crewai.listener import clear_listener_cache
+            clear_listener_cache()
+        except ImportError:
+            pass
+        try:
+            from .langchain.install import clear_handler_cache
+            clear_handler_cache()
+        except ImportError:
+            pass
         
         # Create a new run with the same config
         tenant_id = _config.get("tenant_id") if _config else None
