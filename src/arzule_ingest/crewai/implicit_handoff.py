@@ -18,6 +18,8 @@ import threading
 import uuid
 from typing import TYPE_CHECKING, Any, Optional
 
+from ..ids import new_span_id
+
 if TYPE_CHECKING:
     from ..run import ArzuleRun
 
@@ -101,11 +103,47 @@ def _get_task_identifier(task: Any) -> str:
 
 
 def _get_agent_role(task: Any) -> Optional[str]:
-    """Get the agent role assigned to a task."""
+    """Get the agent role assigned to a task.
+    
+    Tries multiple attributes in order of preference:
+    1. agent.role (standard CrewAI)
+    2. agent.name (fallback if no role)
+    
+    Returns None if no agent or agent has no role/name.
+    Task identifier is stored separately in from_task_id.
+    """
     agent = getattr(task, "agent", None)
     if agent:
-        return getattr(agent, "role", None)
+        # Try role first (standard), then name as fallback
+        role = getattr(agent, "role", None)
+        if role:
+            return role
+        name = getattr(agent, "name", None)
+        if name:
+            return name
     return None
+
+
+def _get_task_display_name(task: Any) -> str:
+    """Get a human-readable display name for a task.
+    
+    Used as fallback when agent role is not available.
+    Returns the task name, or a truncated description, or 'context task'.
+    """
+    # Try task name first
+    name = getattr(task, "name", None)
+    if name:
+        return f"task:{name}"
+    
+    # Fall back to truncated description
+    desc = getattr(task, "description", None)
+    if desc:
+        desc_str = str(desc).strip()
+        if len(desc_str) > 30:
+            desc_str = desc_str[:27] + "..."
+        return f"task:{desc_str}"
+    
+    return "context task"
 
 
 def detect_task_context_handoff(
@@ -134,6 +172,8 @@ def detect_task_context_handoff(
     handoff_keys = []
     receiving_agent = _get_agent_role(task)
     receiving_task_id = _get_task_identifier(task)
+    # Use task display name as fallback when agent role is unknown
+    receiving_display = receiving_agent or _get_task_display_name(task)
     
     for ctx_task in context_tasks:
         # Get info about the providing task
@@ -141,6 +181,8 @@ def detect_task_context_handoff(
         providing_task_id = _get_task_identifier(ctx_task)
         ctx_output = _get_task_output(ctx_task)
         ctx_description = _get_task_description(ctx_task)
+        # Use task display name as fallback when agent role is unknown
+        providing_display = providing_agent or _get_task_display_name(ctx_task)
         
         # Generate handoff key
         handoff_key = str(uuid.uuid4())
@@ -149,9 +191,9 @@ def detect_task_context_handoff(
         # Store pending handoff for correlation
         run._handoff_pending[handoff_key] = {
             "type": "implicit_context",
-            "from_role": providing_agent,
+            "from_role": providing_display,  # Use display name with fallback
             "from_task_id": providing_task_id,
-            "to_role": receiving_agent,
+            "to_role": receiving_display,  # Use display name with fallback
             "to_task_id": receiving_task_id,
             "proposed_at": run.now(),
             "context_output": ctx_output,
@@ -162,7 +204,7 @@ def detect_task_context_handoff(
         payload = {
             "context_source": {
                 "task_id": providing_task_id,
-                "agent_role": providing_agent,
+                "agent_role": providing_display,
                 "description": ctx_description,
             },
             "context_output": ctx_output,
@@ -178,7 +220,7 @@ def detect_task_context_handoff(
             "tenant_id": run.tenant_id,
             "project_id": run.project_id,
             "trace_id": run.trace_id,
-            "span_id": span_id,
+            "span_id": span_id or new_span_id(),
             "parent_span_id": run.current_parent_span_id(),
             "seq": run.next_seq(),
             "ts": run.now(),
@@ -188,13 +230,13 @@ def detect_task_context_handoff(
             } if providing_agent else None,
             "event_type": "handoff.proposed",
             "status": "ok",
-            "summary": f"context handoff: {providing_agent or 'task'} -> {receiving_agent or 'task'}",
+            "summary": f"context handoff: {providing_display} -> {receiving_display}",
             "attrs_compact": {
                 "handoff_key": handoff_key,
                 "handoff_type": "implicit_context",
-                "from_agent_role": providing_agent,
+                "from_agent_role": providing_display,  # Use display name with fallback
                 "from_task_id": providing_task_id,
-                "to_agent_role": receiving_agent,
+                "to_agent_role": receiving_display,  # Use display name with fallback
                 "to_task_id": receiving_task_id,
                 "payload_hash": content_hash,
             },
@@ -230,6 +272,8 @@ def emit_implicit_handoff_complete(
     agent_role = _get_agent_role(task)
     task_output = _get_task_output(task)
     task_description = _get_task_description(task)
+    # Use task display name as fallback when agent role is unknown
+    agent_display = agent_role or _get_task_display_name(task)
     
     # Find all pending handoffs targeting this task
     completed_count = 0
@@ -245,7 +289,7 @@ def emit_implicit_handoff_complete(
         
         keys_to_remove.append(handoff_key)
         
-        # Get the original context that was provided
+        # Get the original context that was provided (from_role already has fallback applied)
         context_output = pending.get("context_output") or pending.get("previous_output")
         from_agent = pending.get("from_role")
         from_task = pending.get("from_task_id")
@@ -275,7 +319,7 @@ def emit_implicit_handoff_complete(
             "tenant_id": run.tenant_id,
             "project_id": run.project_id,
             "trace_id": run.trace_id,
-            "span_id": span_id,
+            "span_id": span_id or new_span_id(),
             "parent_span_id": run.current_parent_span_id(),
             "seq": run.next_seq(),
             "ts": run.now(),
@@ -285,12 +329,12 @@ def emit_implicit_handoff_complete(
             } if agent_role else None,
             "event_type": "handoff.complete",
             "status": status,
-            "summary": result_summary or f"context processed by {agent_role or 'task'}",
+            "summary": result_summary or f"context processed by {agent_display}",
             "attrs_compact": {
                 "handoff_key": handoff_key,
                 "handoff_type": handoff_type,
                 "from_agent_role": from_agent,
-                "to_agent_role": agent_role,
+                "to_agent_role": agent_display,  # Use display name with fallback
                 "result": result_summary,
                 "result_hash": result_hash,
             },
@@ -426,7 +470,7 @@ def detect_sequential_handoff(
         "tenant_id": run.tenant_id,
         "project_id": run.project_id,
         "trace_id": run.trace_id,
-        "span_id": span_id,
+        "span_id": span_id or new_span_id(),
         "parent_span_id": run.current_parent_span_id(),
         "seq": run.next_seq(),
         "ts": run.now(),

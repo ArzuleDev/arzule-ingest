@@ -8,6 +8,8 @@ import re
 import uuid
 from typing import TYPE_CHECKING, Any, Optional
 
+from ..ids import new_span_id
+
 if TYPE_CHECKING:
     from ..run import ArzuleRun
 
@@ -230,7 +232,7 @@ def maybe_emit_handoff_proposed(run: "ArzuleRun", context: Any, span_id: Optiona
         "tenant_id": run.tenant_id,
         "project_id": run.project_id,
         "trace_id": run.trace_id,
-        "span_id": span_id,
+        "span_id": span_id or new_span_id(),
         "parent_span_id": run.current_parent_span_id(),
         "seq": run.next_seq(),
         "ts": run.now(),
@@ -288,7 +290,7 @@ def emit_handoff_ack(
         "tenant_id": run.tenant_id,
         "project_id": run.project_id,
         "trace_id": run.trace_id,
-        "span_id": span_id,
+        "span_id": span_id or new_span_id(),
         "parent_span_id": run.current_parent_span_id(),
         "seq": run.next_seq(),
         "ts": run.now(),
@@ -368,7 +370,7 @@ def emit_handoff_complete(
         "tenant_id": run.tenant_id,
         "project_id": run.project_id,
         "trace_id": run.trace_id,
-        "span_id": span_id,
+        "span_id": span_id or new_span_id(),
         "parent_span_id": run.current_parent_span_id(),
         "seq": run.next_seq(),
         "ts": run.now(),

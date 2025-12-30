@@ -15,6 +15,12 @@ from .handoff import (
     maybe_inject_handoff_key,
     maybe_emit_handoff_proposed,
 )
+from .implicit_handoff import (
+    cleanup_run_tracking,
+    detect_sequential_handoff,
+    detect_task_context_handoff,
+    emit_implicit_handoff_complete,
+)
 from .normalize import evt_from_crewai_event
 
 # Global singleton to prevent GC
@@ -131,10 +137,12 @@ class ArzuleCrewAIListener:
             @bus.on(CrewKickoffCompletedEvent)
             def on_crew_complete(source: Any, event: CrewKickoffCompletedEvent) -> None:
                 self._handle_event(event)
+                self._cleanup_implicit_handoff_tracking()
 
             @bus.on(CrewKickoffFailedEvent)
             def on_crew_failed(source: Any, event: CrewKickoffFailedEvent) -> None:
                 self._handle_event(event)
+                self._cleanup_implicit_handoff_tracking()
 
         except ImportError as e:
             logger.warning(f"Failed to import crew events: {e}")
@@ -177,16 +185,19 @@ class ArzuleCrewAIListener:
             def on_task_start(source: Any, event: TaskStartedEvent) -> None:
                 self._handle_event(event)
                 self._check_handoff_ack(event)
+                self._detect_implicit_handoffs(event)
 
             @bus.on(TaskCompletedEvent)
             def on_task_complete(source: Any, event: TaskCompletedEvent) -> None:
                 self._handle_event(event)
                 self._check_handoff_complete(event, status="ok")
+                self._complete_implicit_handoffs(event, status="ok")
 
             @bus.on(TaskFailedEvent)
             def on_task_failed(source: Any, event: TaskFailedEvent) -> None:
                 self._handle_event(event)
                 self._check_handoff_complete(event, status="error")
+                self._complete_implicit_handoffs(event, status="error")
 
 
         except ImportError as e:
@@ -287,6 +298,7 @@ class ArzuleCrewAIListener:
             @bus.on(FlowFinishedEvent)
             def on_flow_end(source: Any, event: FlowFinishedEvent) -> None:
                 self._handle_event(event)
+                self._cleanup_implicit_handoff_tracking()
 
             @bus.on(MethodExecutionStartedEvent)
             def on_method_start(source: Any, event: MethodExecutionStartedEvent) -> None:
@@ -627,6 +639,55 @@ class ArzuleCrewAIListener:
                 status=status,
                 result_summary=result_summary,
             )
+
+    def _detect_implicit_handoffs(self, event: Any) -> None:
+        """Detect implicit handoffs when a task starts.
+        
+        Checks for:
+        1. Context dependencies - when task.context includes other tasks
+        2. Sequential transitions - when different agents run tasks in sequence
+        
+        These are detected separately from explicit delegation tool handoffs.
+        """
+        run = current_run(run_id_hint=self._get_cached_run_id())
+        if not run:
+            return
+
+        task = getattr(event, "task", None)
+        if not task:
+            return
+
+        # Detect context-based handoffs (task.context dependencies)
+        detect_task_context_handoff(run, task)
+
+        # Detect sequential agent transitions
+        detect_sequential_handoff(run, task)
+
+    def _complete_implicit_handoffs(self, event: Any, status: str) -> None:
+        """Complete any implicit handoffs when a task finishes.
+        
+        Emits handoff.complete events for context and sequential handoffs
+        that targeted this task.
+        """
+        run = current_run(run_id_hint=self._get_cached_run_id())
+        if not run:
+            return
+
+        task = getattr(event, "task", None)
+        if not task:
+            return
+
+        emit_implicit_handoff_complete(run, task, status=status)
+
+    def _cleanup_implicit_handoff_tracking(self) -> None:
+        """Clean up implicit handoff tracking when a crew/flow completes.
+        
+        Clears the last completed task tracking to prevent stale data
+        from affecting subsequent runs.
+        """
+        run = current_run(run_id_hint=self._get_cached_run_id())
+        if run:
+            cleanup_run_tracking(run.run_id)
 
 
 def get_listener() -> ArzuleCrewAIListener:
