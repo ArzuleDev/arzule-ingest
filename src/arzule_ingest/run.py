@@ -119,6 +119,9 @@ class ArzuleRun:
     # Pending handoffs awaiting ack/complete
     _handoff_pending: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
 
+    # Closed flag to prevent emissions after __exit__
+    _closed: bool = field(default=False, repr=False)
+
     # Helper managers (composition)
     _span_manager: Optional[SpanManager] = field(default=None, repr=False, init=False)
     _task_manager: Optional[TaskManager] = field(default=None, repr=False, init=False)
@@ -312,7 +315,13 @@ class ArzuleRun:
     # =========================================================================
 
     def emit(self, evt: dict[str, Any]) -> None:
-        """Emit a trace event to the configured sink."""
+        """Emit a trace event to the configured sink.
+        
+        Silently drops events if the run has been closed to prevent
+        race conditions with background threads during run transitions.
+        """
+        if self._closed:
+            return
         self.sink.write(evt)
 
     def _make_event(
@@ -403,6 +412,10 @@ class ArzuleRun:
                 attrs_compact=attrs,
             )
         )
+
+        # Mark run as closed to prevent background threads from emitting
+        # stale events after this point (race condition fix)
+        self._closed = True
 
         try:
             self.sink.flush()

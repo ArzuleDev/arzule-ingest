@@ -62,15 +62,67 @@ def _extract_input_keys(tool_input: Any, max_keys: int = 10) -> list[str]:
 
 
 def _extract_agent_info(agent: Any) -> Optional[dict[str, Any]]:
-    """Extract agent info from CrewAI agent object."""
+    """Extract agent info from CrewAI agent object.
+    
+    Extracts key agent attributes that are useful for trace analysis:
+    - role: Agent's function/expertise within the crew
+    - goal: Individual objective guiding decision-making
+    - allow_delegation: Whether agent can delegate to others (critical for handoff analysis)
+    - tools: List of tool names available to the agent
+    - max_iter: Maximum iterations before agent must provide answer
+    - max_execution_time: Timeout in seconds
+    - verbose: Whether detailed logging is enabled
+    """
     if not agent:
         return None
 
     role = _safe_getattr(agent, "role", None) or _safe_getattr(agent, "name", "unknown")
-    return {
+    
+    info: dict[str, Any] = {
         "id": f"crewai:role:{role}",
         "role": role,
     }
+    
+    # Goal - provides context for agent behavior
+    goal = _safe_getattr(agent, "goal", None)
+    if goal:
+        info["goal"] = goal
+    
+    # Delegation capability - critical for handoff analysis
+    allow_delegation = _safe_getattr(agent, "allow_delegation", None)
+    if allow_delegation is not None:
+        info["allow_delegation"] = bool(allow_delegation)
+    
+    # Tools available to the agent
+    tools = _safe_getattr(agent, "tools", None)
+    if tools:
+        # Extract tool names, handling both Tool objects and strings
+        tool_names = []
+        for tool in tools:
+            if hasattr(tool, "name"):
+                tool_names.append(tool.name)
+            elif hasattr(tool, "__name__"):
+                tool_names.append(tool.__name__)
+            elif isinstance(tool, str):
+                tool_names.append(tool)
+        if tool_names:
+            info["tools"] = tool_names
+    
+    # Iteration/execution limits
+    max_iter = _safe_getattr(agent, "max_iter", None)
+    if max_iter is not None:
+        info["max_iter"] = max_iter
+    
+    max_execution_time = _safe_getattr(agent, "max_execution_time", None)
+    if max_execution_time is not None:
+        info["max_execution_time"] = max_execution_time
+    
+    # Verbose mode
+    verbose = _safe_getattr(agent, "verbose", None)
+    if verbose is not None:
+        info["verbose"] = bool(verbose)
+    
+    return info
 
 
 def extract_agent_info_from_event(event: Any) -> Optional[dict[str, Any]]:
@@ -97,6 +149,185 @@ def _extract_task_info(task: Any) -> tuple[Optional[str], Optional[str]]:
     task_id = _safe_getattr(task, "id", None) or _safe_getattr(task, "name", None)
     description = _safe_getattr(task, "description", None)
     return task_id, description
+
+
+def _extract_crew_details(crew: Any) -> dict[str, Any]:
+    """Extract detailed crew attributes from CrewAI crew.
+    
+    Captures key crew configuration that affects execution behavior:
+    - process: Sequential or hierarchical execution flow
+    - memory: Whether memory (short/long-term, entity) is enabled
+    - cache: Whether tool result caching is enabled
+    - planning: Whether agent planning is enabled
+    - verbose: Logging verbosity level
+    - max_rpm: Rate limiting configuration
+    - agent_count/task_count: Crew composition
+    
+    See: https://docs.crewai.com/en/concepts/crews#crew-attributes
+    """
+    if not crew:
+        return {}
+    
+    details: dict[str, Any] = {}
+    
+    # Crew identification
+    crew_name = _safe_getattr(crew, "name", None)
+    if crew_name:
+        details["name"] = crew_name
+    
+    crew_id = _safe_getattr(crew, "id", None)
+    if crew_id:
+        details["id"] = str(crew_id)
+    
+    # Process type (sequential vs hierarchical) - critical for understanding execution
+    process = _safe_getattr(crew, "process", None)
+    if process is not None:
+        # Process is an enum, get its value
+        if hasattr(process, "value"):
+            details["process"] = process.value
+        elif hasattr(process, "name"):
+            details["process"] = process.name
+        else:
+            details["process"] = str(process)
+    
+    # Memory configuration
+    memory = _safe_getattr(crew, "memory", None)
+    if memory is not None:
+        details["memory_enabled"] = bool(memory)
+    
+    # Cache configuration
+    cache = _safe_getattr(crew, "cache", None)
+    if cache is not None:
+        details["cache_enabled"] = bool(cache)
+    
+    # Planning configuration
+    planning = _safe_getattr(crew, "planning", None)
+    if planning is not None:
+        details["planning_enabled"] = bool(planning)
+    
+    # Verbose/logging level
+    verbose = _safe_getattr(crew, "verbose", None)
+    if verbose is not None:
+        details["verbose"] = bool(verbose)
+    
+    # Rate limiting
+    max_rpm = _safe_getattr(crew, "max_rpm", None)
+    if max_rpm is not None:
+        details["max_rpm"] = max_rpm
+    
+    # Crew composition
+    agents = _safe_getattr(crew, "agents", None)
+    if agents and isinstance(agents, (list, tuple)):
+        details["agent_count"] = len(agents)
+        # Extract agent roles for quick reference
+        agent_roles = []
+        for agent in agents:
+            role = _safe_getattr(agent, "role", None)
+            if role:
+                agent_roles.append(role)
+        if agent_roles:
+            details["agent_roles"] = agent_roles
+    
+    tasks = _safe_getattr(crew, "tasks", None)
+    if tasks and isinstance(tasks, (list, tuple)):
+        details["task_count"] = len(tasks)
+    
+    # Manager agent (for hierarchical process)
+    manager_agent = _safe_getattr(crew, "manager_agent", None)
+    if manager_agent:
+        manager_role = _safe_getattr(manager_agent, "role", None)
+        if manager_role:
+            details["manager_agent_role"] = manager_role
+    
+    # Knowledge sources
+    knowledge_sources = _safe_getattr(crew, "knowledge_sources", None)
+    if knowledge_sources and isinstance(knowledge_sources, (list, tuple)):
+        details["knowledge_source_count"] = len(knowledge_sources)
+    
+    return details
+
+
+def _extract_task_details(task: Any) -> dict[str, Any]:
+    """Extract detailed task attributes from CrewAI task.
+    
+    Captures key task configuration that affects execution behavior:
+    - context: Other tasks whose outputs are used (drives implicit handoffs)
+    - tools: Task-specific tools available
+    - human_input: Whether human review is required
+    - async_execution: Whether task runs asynchronously
+    - expected_output: What the task should produce
+    - guardrails: Validation functions applied to output
+    - output_file: File path for task output
+    
+    See: https://docs.crewai.com/en/concepts/tasks#task-attributes
+    """
+    if not task:
+        return {}
+    
+    details: dict[str, Any] = {}
+    
+    # Core identification
+    task_id = _safe_getattr(task, "id", None) or _safe_getattr(task, "name", None)
+    if task_id:
+        details["id"] = task_id
+    
+    description = _safe_getattr(task, "description", None)
+    if description:
+        details["description"] = description
+    
+    expected_output = _safe_getattr(task, "expected_output", None)
+    if expected_output:
+        details["expected_output"] = expected_output
+    
+    # Execution configuration
+    async_execution = _safe_getattr(task, "async_execution", None)
+    if async_execution is not None:
+        details["async_execution"] = bool(async_execution)
+    
+    human_input = _safe_getattr(task, "human_input", None)
+    if human_input is not None:
+        details["human_input"] = bool(human_input)
+    
+    # Context tasks (critical for implicit handoff tracking)
+    context = _safe_getattr(task, "context", None)
+    if context:
+        context_task_ids = []
+        if isinstance(context, (list, tuple)):
+            for ctx_task in context:
+                ctx_id = _safe_getattr(ctx_task, "id", None) or _safe_getattr(ctx_task, "name", None)
+                if ctx_id:
+                    context_task_ids.append(ctx_id)
+        if context_task_ids:
+            details["context_task_ids"] = context_task_ids
+    
+    # Task-specific tools
+    tools = _safe_getattr(task, "tools", None)
+    if tools:
+        tool_names = []
+        for tool in tools:
+            if hasattr(tool, "name"):
+                tool_names.append(tool.name)
+            elif hasattr(tool, "__name__"):
+                tool_names.append(tool.__name__)
+            elif isinstance(tool, str):
+                tool_names.append(tool)
+        if tool_names:
+            details["tools"] = tool_names
+    
+    # Output configuration
+    output_file = _safe_getattr(task, "output_file", None)
+    if output_file:
+        details["output_file"] = output_file
+    
+    # Guardrails (validation)
+    guardrails = _safe_getattr(task, "guardrails", None) or _safe_getattr(task, "guardrail", None)
+    if guardrails:
+        details["has_guardrails"] = True
+        guardrail_max_retries = _safe_getattr(task, "guardrail_max_retries", None)
+        if guardrail_max_retries is not None:
+            details["guardrail_max_retries"] = guardrail_max_retries
+    
+    return details
 
 
 def _extract_token_usage(response: Any) -> Optional[dict[str, int]]:
@@ -251,6 +482,15 @@ def evt_from_crewai_event(
         # Flow events
         "FlowStartedEvent": "flow.start",
         "FlowFinishedEvent": "flow.complete",
+        "FlowCreatedEvent": "flow.created",
+        "FlowPausedEvent": "flow.paused",
+        "MethodExecutionStartedEvent": "flow.method.start",
+        "MethodExecutionFinishedEvent": "flow.method.complete",
+        "MethodExecutionFailedEvent": "flow.method.failed",
+        "MethodExecutionPausedEvent": "flow.method.paused",
+        # Human feedback events (Flow HITL)
+        "HumanFeedbackRequestedEvent": "flow.human_feedback.requested",
+        "HumanFeedbackReceivedEvent": "flow.human_feedback.received",
         # Memory events
         "MemoryQueryStartedEvent": "memory.query.start",
         "MemoryQueryCompletedEvent": "memory.query.end",
@@ -268,6 +508,13 @@ def evt_from_crewai_event(
         "AgentReasoningStartedEvent": "agent.reasoning.start",
         "AgentReasoningCompletedEvent": "agent.reasoning.end",
         "AgentReasoningFailedEvent": "agent.reasoning.error",
+        # A2A (Agent-to-Agent) delegation events
+        "A2ADelegationStartedEvent": "a2a.delegation.start",
+        "A2ADelegationCompletedEvent": "a2a.delegation.complete",
+        "A2AConversationStartedEvent": "a2a.conversation.start",
+        "A2AConversationCompletedEvent": "a2a.conversation.complete",
+        "A2AMessageSentEvent": "a2a.message.sent",
+        "A2AResponseReceivedEvent": "a2a.response.received",
     }
 
     event_type = event_type_map.get(event_class, f"crewai.{event_class}")
@@ -306,6 +553,22 @@ def evt_from_crewai_event(
     # Extract result/error for completed/failed events
     payload: dict[str, Any] = {}
     attrs: dict[str, Any] = {}
+    
+    # Add extended agent info to attrs for queryable storage
+    # (agent.id and agent.role go into indexed columns, rest goes here)
+    if agent_info:
+        if agent_info.get("allow_delegation") is not None:
+            attrs["agent_allow_delegation"] = agent_info["allow_delegation"]
+        if agent_info.get("goal"):
+            attrs["agent_goal"] = agent_info["goal"]
+        if agent_info.get("tools"):
+            attrs["agent_tools"] = agent_info["tools"]
+        if agent_info.get("max_iter") is not None:
+            attrs["agent_max_iter"] = agent_info["max_iter"]
+        if agent_info.get("max_execution_time") is not None:
+            attrs["agent_max_execution_time"] = agent_info["max_execution_time"]
+        if agent_info.get("verbose") is not None:
+            attrs["agent_verbose"] = agent_info["verbose"]
 
     result = _safe_getattr(event, "result", None)
     if result is not None:
@@ -319,18 +582,103 @@ def evt_from_crewai_event(
     if error is not None:
         attrs["error"] = truncate_string(str(error), 200)
 
-    # Crew info
+    # Crew info (detailed extraction)
     if crew:
-        attrs["crew_name"] = _safe_getattr(crew, "name", None)
+        crew_details = _extract_crew_details(crew)
+        payload["crew"] = sanitize(crew_details)
+        
+        # Add key crew attributes to attrs for queryable storage
+        if crew_details.get("name"):
+            attrs["crew_name"] = crew_details["name"]
+        if crew_details.get("process"):
+            attrs["crew_process"] = crew_details["process"]
+        if crew_details.get("memory_enabled"):
+            attrs["crew_memory_enabled"] = True
+        if crew_details.get("planning_enabled"):
+            attrs["crew_planning_enabled"] = True
+        if crew_details.get("agent_count"):
+            attrs["crew_agent_count"] = crew_details["agent_count"]
+        if crew_details.get("task_count"):
+            attrs["crew_task_count"] = crew_details["task_count"]
+        if crew_details.get("manager_agent_role"):
+            attrs["crew_manager_role"] = crew_details["manager_agent_role"]
 
-    # Task info in payload
+    # Task info in payload (detailed extraction)
     if task is not None:
-        payload["task"] = sanitize({
-            "id": _safe_getattr(task, "id", None),
-            "description": _safe_getattr(task, "description", None),
-            "expected_output": _safe_getattr(task, "expected_output", None),
-            "async_execution": _safe_getattr(task, "async_execution", None),
-        })
+        task_details = _extract_task_details(task)
+        payload["task"] = sanitize(task_details)
+        
+        # Add key task attributes to attrs for queryable storage
+        if task_details.get("async_execution"):
+            attrs["task_async_execution"] = True
+        if task_details.get("human_input"):
+            attrs["task_human_input"] = True
+        if task_details.get("context_task_ids"):
+            attrs["task_context_ids"] = task_details["context_task_ids"]
+        if task_details.get("tools"):
+            attrs["task_tools"] = task_details["tools"]
+        if task_details.get("has_guardrails"):
+            attrs["task_has_guardrails"] = True
+        if task_details.get("output_file"):
+            attrs["task_output_file"] = task_details["output_file"]
+
+    # Flow event info (for multi-crew orchestration)
+    flow_name = _safe_getattr(event, "flow_name", None)
+    method_name = _safe_getattr(event, "method_name", None)
+    flow_state = _safe_getattr(event, "state", None)
+    flow_params = _safe_getattr(event, "params", None)
+    flow_inputs = _safe_getattr(event, "inputs", None)
+    flow_id = _safe_getattr(event, "flow_id", None)
+    
+    if flow_name:
+        attrs["flow_name"] = flow_name
+        # Update summary for flow events
+        if "flow" in event_type or "method" in event_type:
+            summary_parts = [event_type, f"flow={flow_name}"]
+            if method_name:
+                summary_parts.append(f"method={method_name}")
+            summary = " ".join(summary_parts)
+    
+    if method_name:
+        attrs["method_name"] = method_name
+    
+    if flow_id:
+        attrs["flow_id"] = flow_id
+    
+    # Flow state (convert Pydantic models to dict)
+    if flow_state is not None:
+        state_dict = None
+        if hasattr(flow_state, "model_dump"):
+            state_dict = flow_state.model_dump()
+        elif hasattr(flow_state, "dict"):
+            state_dict = flow_state.dict()
+        elif isinstance(flow_state, dict):
+            state_dict = flow_state
+        if state_dict:
+            payload["flow_state"] = sanitize(state_dict)
+    
+    # Flow method params
+    if flow_params is not None:
+        payload["flow_params"] = sanitize(flow_params)
+    
+    # Flow inputs (for FlowStartedEvent)
+    if flow_inputs is not None:
+        payload["flow_inputs"] = sanitize(flow_inputs)
+    
+    # Human feedback events (HITL)
+    feedback_message = _safe_getattr(event, "message", None)
+    feedback_text = _safe_getattr(event, "feedback", None)
+    feedback_outcome = _safe_getattr(event, "outcome", None)
+    feedback_emit = _safe_getattr(event, "emit", None)
+    
+    if feedback_message:
+        attrs["feedback_message"] = truncate_string(feedback_message, 200)
+    if feedback_text:
+        payload["feedback"] = truncate_string(feedback_text, 1000)
+    if feedback_outcome:
+        attrs["feedback_outcome"] = feedback_outcome
+    if feedback_emit:
+        attrs["feedback_emit_options"] = feedback_emit
 
     # Tool info in payload/attrs
     if tool_name:
@@ -367,6 +715,114 @@ def evt_from_crewai_event(
         token_usage = _extract_token_usage(response)
         if token_usage:
             attrs.update(token_usage)
+
+    # LLM model info
+    model = _safe_getattr(event, "model", None)
+    if model:
+        attrs["llm_model"] = model
+
+    # Memory event info
+    memory_query = _safe_getattr(event, "query", None)
+    memory_limit = _safe_getattr(event, "limit", None)
+    memory_score_threshold = _safe_getattr(event, "score_threshold", None)
+    memory_results = _safe_getattr(event, "results", None)
+    memory_query_time = _safe_getattr(event, "query_time_ms", None)
+    memory_value = _safe_getattr(event, "value", None)
+    memory_metadata = _safe_getattr(event, "metadata", None)
+    memory_save_time = _safe_getattr(event, "save_time_ms", None)
+    memory_content = _safe_getattr(event, "memory_content", None)
+    memory_retrieval_time = _safe_getattr(event, "retrieval_time_ms", None)
+    
+    if memory_query and "memory" in event_type:
+        attrs["memory_query"] = truncate_string(memory_query, 200)
+    if memory_limit is not None:
+        attrs["memory_limit"] = memory_limit
+    if memory_score_threshold is not None:
+        attrs["memory_score_threshold"] = memory_score_threshold
+    if memory_results is not None:
+        payload["memory_results"] = sanitize(memory_results)
+    if memory_query_time is not None:
+        attrs["memory_query_time_ms"] = memory_query_time
+    if memory_value:
+        payload["memory_value"] = truncate_string(memory_value, 500)
+    if memory_metadata:
+        payload["memory_metadata"] = sanitize(memory_metadata)
+    if memory_save_time is not None:
+        attrs["memory_save_time_ms"] = memory_save_time
+    if memory_content:
+        payload["memory_content"] = truncate_string(memory_content, 1000)
+    if memory_retrieval_time is not None:
+        attrs["memory_retrieval_time_ms"] = memory_retrieval_time
+
+    # Knowledge event info
+    knowledge_query = _safe_getattr(event, "query", None)
+    knowledge_task_prompt = _safe_getattr(event, "task_prompt", None)
+    knowledge_retrieved = _safe_getattr(event, "retrieved_knowledge", None)
+    
+    if knowledge_query and "knowledge" in event_type:
+        attrs["knowledge_query"] = truncate_string(knowledge_query, 200)
+    if knowledge_task_prompt:
+        payload["knowledge_task_prompt"] = truncate_string(knowledge_task_prompt, 500)
+    if knowledge_retrieved:
+        payload["knowledge_retrieved"] = truncate_string(knowledge_retrieved, 1000)
+
+    # A2A (Agent-to-Agent) delegation event info
+    if "a2a" in event_type:
+        # Delegation info
+        a2a_endpoint = _safe_getattr(event, "endpoint", None)
+        a2a_task_description = _safe_getattr(event, "task_description", None)
+        a2a_agent_id = _safe_getattr(event, "agent_id", None)
+        a2a_is_multiturn = _safe_getattr(event, "is_multiturn", None)
+        a2a_turn_number = _safe_getattr(event, "turn_number", None)
+        a2a_status = _safe_getattr(event, "status", None)
+        a2a_result = _safe_getattr(event, "result", None)
+        a2a_final_result = _safe_getattr(event, "final_result", None)
+        a2a_error = _safe_getattr(event, "error", None)
+        a2a_message = _safe_getattr(event, "message", None)
+        a2a_response = _safe_getattr(event, "response", None)
+        a2a_agent_name = _safe_getattr(event, "a2a_agent_name", None)
+        a2a_total_turns = _safe_getattr(event, "total_turns", None)
+        a2a_agent_role = _safe_getattr(event, "agent_role", None)
+        
+        if a2a_endpoint:
+            attrs["a2a_endpoint"] = a2a_endpoint
+        if a2a_agent_id:
+            attrs["a2a_agent_id"] = a2a_agent_id
+        if a2a_agent_name:
+            attrs["a2a_agent_name"] = a2a_agent_name
+        if a2a_is_multiturn is not None:
+            attrs["a2a_is_multiturn"] = a2a_is_multiturn
+        if a2a_turn_number is not None:
+            attrs["a2a_turn_number"] = a2a_turn_number
+        if a2a_total_turns is not None:
+            attrs["a2a_total_turns"] = a2a_total_turns
+        if a2a_status:
+            attrs["a2a_status"] = a2a_status
+        if a2a_agent_role:
+            attrs["a2a_agent_role"] = a2a_agent_role
+        
+        if a2a_task_description:
+            payload["a2a_task_description"] = truncate_string(a2a_task_description, 500)
+        if a2a_result:
+            payload["a2a_result"] = truncate_string(str(a2a_result), 1000)
+        if a2a_final_result:
+            payload["a2a_final_result"] = truncate_string(str(a2a_final_result), 1000)
+        if a2a_error:
+            attrs["a2a_error"] = truncate_string(str(a2a_error), 200)
+        if a2a_message:
+            payload["a2a_message"] = truncate_string(a2a_message, 1000)
+        if a2a_response:
+            payload["a2a_response"] = truncate_string(a2a_response, 1000)
+        
+        # Update summary for A2A events
+        summary_parts = [event_type]
+        if a2a_agent_id:
+            summary_parts.append(f"agent={a2a_agent_id}")
+        if a2a_turn_number is not None:
+            summary_parts.append(f"turn={a2a_turn_number}")
+        if a2a_status:
+            summary_parts.append(f"status={a2a_status}")
+        summary = " ".join(summary_parts)
 
     # Determine parent span:
     # 1. Use explicit parent_span_id if provided (concurrent mode)

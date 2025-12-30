@@ -138,3 +138,4 @@ def log_async_task_completed(run_id: str, task_key: str) -> None:
         f"Async task completed | run_id={run_id} | task_key={task_key}"
     )
 
+

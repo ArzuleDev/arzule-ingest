@@ -163,12 +163,15 @@ def maybe_inject_handoff_key(run: "ArzuleRun", context: Any) -> Optional[str]:
             break
 
     # Store pending handoff metadata for later correlation
+    # IMPORTANT: Include tool_input so we can compare the original delegation
+    # context against the result for context drift detection
     agent = getattr(context, "agent", None)
     run._handoff_pending[handoff_key] = {
         "from_role": getattr(agent, "role", None) if agent else None,
         "from_agent_id": f"crewai:role:{getattr(agent, 'role', 'unknown')}" if agent else None,
         "tool_name": tool_name,
         "proposed_at": run.now(),
+        "tool_input": tool_input.copy() if tool_input else {},  # Store for drift detection
     }
 
     return handoff_key
