@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ..ids import new_span_id
 from ..sanitize import sanitize, truncate_string
+from .handoff import is_delegation_tool
 
 if TYPE_CHECKING:
     from ..run import ArzuleRun
@@ -530,6 +531,17 @@ def evt_from_crewai_event(
     crew = _safe_getattr(event, "crew", None)
 
     agent_info = _extract_agent_info(agent)
+    
+    # Fallback: check for agent_role/agent_id directly on event (e.g., LLM events)
+    # CrewAI's LLM events set agent_role/agent_id directly from from_agent, not as nested object
+    if not agent_info:
+        agent_role = _safe_getattr(event, "agent_role", None)
+        if agent_role:
+            agent_id = _safe_getattr(event, "agent_id", None)
+            agent_info = {
+                "id": agent_id or f"crewai:role:{agent_role}",
+                "role": agent_role,
+            }
     task_id, task_desc = _extract_task_info(task)
 
     # Tool info for tool events
@@ -683,6 +695,10 @@ def evt_from_crewai_event(
     # Tool info in payload/attrs
     if tool_name:
         attrs["tool_name"] = tool_name
+        
+        # Mark delegation tools as handoffs for visual distinction in UI
+        if is_delegation_tool(tool_name):
+            attrs["is_handoff"] = True
         
         # Add detection fields for forensics (tool events)
         if tool_input is not None:

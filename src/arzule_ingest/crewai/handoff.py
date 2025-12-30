@@ -54,11 +54,17 @@ def _extract_payload_keys(payload: Any, max_keys: int = 15) -> list[str]:
 HANDOFF_RE = re.compile(r"\[arzule_handoff:([0-9a-f-]{36})\]")
 
 # Exact tool names that indicate delegation (CrewAI standard tools)
+# These match the `name` attribute from:
+#   - crewai.tools.agent_tools.DelegateWorkTool: "Delegate work to coworker"
+#   - crewai.tools.agent_tools.AskQuestionTool: "Ask question to coworker"
+# See: https://docs.crewai.com/en/concepts/collaboration
 DELEGATION_TOOL_NAMES = {
-    "delegate_work_to_coworker",
-    "ask_question_to_coworker",
+    # Exact CrewAI tool names (as defined in the tool classes)
     "Delegate work to coworker",
     "Ask question to coworker",
+    # Snake_case variants (for compatibility with different frameworks/versions)
+    "delegate_work_to_coworker",
+    "ask_question_to_coworker",
 }
 
 # Patterns that indicate delegation/handoff when found in tool names

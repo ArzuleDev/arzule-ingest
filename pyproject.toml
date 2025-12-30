@@ -1,6 +1,6 @@
 [project]
 name = "arzule-ingest"
-version = "0.5.18"
+version = "0.5.16"
 description = "Lightweight SDK for capturing multi-agent traces and sending to Arzule"
 readme = "README.md"
 requires-python = ">=3.10"

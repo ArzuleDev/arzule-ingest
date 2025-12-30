@@ -90,39 +90,16 @@ class ArzuleCrewAIListener:
         logger = get_logger()
         logger.info("Setting up CrewAI event listeners")
 
-        # Register for crew events
+        # Register all event handlers
         self._register_crew_events(crewai_event_bus)
-        logger.debug("Registered crew event handlers")
-
-        # Register for agent events
         self._register_agent_events(crewai_event_bus)
-        logger.debug("Registered agent event handlers")
-
-        # Register for task events
         self._register_task_events(crewai_event_bus)
-        logger.debug("Registered task event handlers")
-
-        # Register for tool events
         self._register_tool_events(crewai_event_bus)
-        logger.debug("Registered tool event handlers")
-
-        # Register for LLM events
         self._register_llm_events(crewai_event_bus)
-        logger.debug("Registered LLM event handlers")
-
-        # Register for flow events (multi-crew orchestration)
         self._register_flow_events(crewai_event_bus)
-        logger.debug("Registered flow event handlers")
-
-        # Register for memory events (optional - newer CrewAI versions)
         self._register_memory_events(crewai_event_bus)
-
-        # Register for knowledge events (optional - newer CrewAI versions)
         self._register_knowledge_events(crewai_event_bus)
-
-        # Register for A2A (Agent-to-Agent) delegation events (for tracking delegation)
         self._register_a2a_events(crewai_event_bus)
-        logger.debug("Registered A2A delegation event handlers")
 
         self._setup_complete = True
         logger.info("CrewAI event listeners setup complete")
@@ -136,22 +113,16 @@ class ArzuleCrewAIListener:
                 CrewKickoffFailedEvent,
                 CrewKickoffStartedEvent,
             )
-            logger.debug(f"Crew event classes imported: {CrewKickoffStartedEvent}, {CrewKickoffCompletedEvent}")
 
             @bus.on(CrewKickoffStartedEvent)
             def on_crew_start(source: Any, event: CrewKickoffStartedEvent) -> None:
-                logger.debug(f"CrewKickoffStartedEvent received from bus")
                 # Ensure a run exists before handling crew start
-                # This creates the run lazily on first crew kickoff
                 import arzule_ingest
                 run_id = arzule_ingest.ensure_run()
-                logger.debug(f"Run ensured: run_id={run_id}")
                 
                 # Cache run_id for thread fallback (for concurrent tasks)
-                # Use run_id from ensure_run() as hint for robustness
                 if run_id:
                     self._cache_run_id(run_id)
-                    logger.debug(f"Run cached: run_id={run_id}")
                 else:
                     logger.warning("ensure_run() returned None - SDK not initialized?")
                 
@@ -159,15 +130,11 @@ class ArzuleCrewAIListener:
 
             @bus.on(CrewKickoffCompletedEvent)
             def on_crew_complete(source: Any, event: CrewKickoffCompletedEvent) -> None:
-                logger.debug(f"CrewKickoffCompletedEvent received from bus")
                 self._handle_event(event)
 
             @bus.on(CrewKickoffFailedEvent)
             def on_crew_failed(source: Any, event: CrewKickoffFailedEvent) -> None:
-                logger.debug(f"CrewKickoffFailedEvent received from bus")
                 self._handle_event(event)
-
-            logger.debug("Crew event handlers registered successfully")
 
         except ImportError as e:
             logger.warning(f"Failed to import crew events: {e}")
@@ -181,24 +148,18 @@ class ArzuleCrewAIListener:
                 AgentExecutionErrorEvent,
                 AgentExecutionStartedEvent,
             )
-            logger.debug(f"Agent event classes imported: {AgentExecutionStartedEvent}, {AgentExecutionCompletedEvent}")
-
             @bus.on(AgentExecutionStartedEvent)
             def on_agent_start(source: Any, event: AgentExecutionStartedEvent) -> None:
-                logger.debug(f"AgentExecutionStartedEvent received from bus: {event}")
                 self._handle_event(event)
 
             @bus.on(AgentExecutionCompletedEvent)
             def on_agent_complete(source: Any, event: AgentExecutionCompletedEvent) -> None:
-                logger.debug(f"AgentExecutionCompletedEvent received from bus: {event}")
                 self._handle_event(event)
 
             @bus.on(AgentExecutionErrorEvent)
             def on_agent_error(source: Any, event: AgentExecutionErrorEvent) -> None:
-                logger.debug(f"AgentExecutionErrorEvent received from bus: {event}")
                 self._handle_event(event)
 
-            logger.debug("Agent event handlers registered successfully")
 
         except ImportError as e:
             logger.warning(f"Failed to import agent events: {e}")
@@ -212,27 +173,21 @@ class ArzuleCrewAIListener:
                 TaskFailedEvent,
                 TaskStartedEvent,
             )
-            logger.debug(f"Task event classes imported: {TaskStartedEvent}, {TaskCompletedEvent}, {TaskFailedEvent}")
-
             @bus.on(TaskStartedEvent)
             def on_task_start(source: Any, event: TaskStartedEvent) -> None:
-                logger.debug(f"TaskStartedEvent received from bus: {event}")
                 self._handle_event(event)
                 self._check_handoff_ack(event)
 
             @bus.on(TaskCompletedEvent)
             def on_task_complete(source: Any, event: TaskCompletedEvent) -> None:
-                logger.debug(f"TaskCompletedEvent received from bus: {event}")
                 self._handle_event(event)
                 self._check_handoff_complete(event, status="ok")
 
             @bus.on(TaskFailedEvent)
             def on_task_failed(source: Any, event: TaskFailedEvent) -> None:
-                logger.debug(f"TaskFailedEvent received from bus: {event}")
                 self._handle_event(event)
                 self._check_handoff_complete(event, status="error")
 
-            logger.debug("Task event handlers registered successfully")
 
         except ImportError as e:
             logger.warning(f"Failed to import task events: {e}")
@@ -246,31 +201,20 @@ class ArzuleCrewAIListener:
                 ToolUsageStartedEvent,
                 ToolUsageErrorEvent,
             )
-            logger.debug(f"Tool event classes imported: {ToolUsageStartedEvent}, {ToolUsageFinishedEvent}")
 
             @bus.on(ToolUsageStartedEvent)
             def on_tool_start(source: Any, event: ToolUsageStartedEvent) -> None:
-                tool_name = getattr(event, "tool_name", "unknown")
-                logger.debug(f"ToolUsageStartedEvent received from bus: tool={tool_name}")
                 self._handle_event(event)
-                # Inject handoff key for delegation tools
                 self._maybe_inject_delegation_handoff(event)
 
             @bus.on(ToolUsageFinishedEvent)
             def on_tool_end(source: Any, event: ToolUsageFinishedEvent) -> None:
-                tool_name = getattr(event, "tool_name", "unknown")
-                logger.debug(f"ToolUsageFinishedEvent received from bus: tool={tool_name}")
                 self._handle_event(event)
-                # Emit handoff.proposed for delegation tools
                 self._maybe_emit_delegation_handoff(event)
 
             @bus.on(ToolUsageErrorEvent)
             def on_tool_error(source: Any, event: ToolUsageErrorEvent) -> None:
-                tool_name = getattr(event, "tool_name", "unknown")
-                logger.debug(f"ToolUsageErrorEvent received from bus: tool={tool_name}")
                 self._handle_event(event)
-
-            logger.debug("Tool event handlers registered successfully")
 
         except ImportError as e:
             logger.warning(f"Failed to import tool events: {e}")
@@ -328,20 +272,15 @@ class ArzuleCrewAIListener:
 
             @bus.on(FlowStartedEvent)
             def on_flow_start(source: Any, event: FlowStartedEvent) -> None:
-                logger = get_logger()
-                logger.debug(f"FlowStartedEvent received from bus")
                 # Ensure a run exists before handling flow start
                 import arzule_ingest
                 run_id = arzule_ingest.ensure_run()
-                logger.debug(f"Run ensured: run_id={run_id}")
                 
                 # Cache run_id for thread fallback (for concurrent tasks)
-                # Use run_id from ensure_run() as hint for robustness
                 if run_id:
                     self._cache_run_id(run_id)
-                    logger.debug(f"Run cached: run_id={run_id}")
                 else:
-                    logger.warning("ensure_run() returned None - SDK not initialized?")
+                    get_logger().warning("ensure_run() returned None - SDK not initialized?")
                 
                 self._handle_event(event)
 
@@ -497,43 +436,34 @@ class ArzuleCrewAIListener:
                 A2AMessageSentEvent,
                 A2AResponseReceivedEvent,
             )
-            logger.debug(f"A2A event classes imported: {A2ADelegationStartedEvent}, {A2ADelegationCompletedEvent}")
 
             @bus.on(A2ADelegationStartedEvent)
             def on_a2a_delegation_start(source: Any, event: A2ADelegationStartedEvent) -> None:
-                logger.debug(f"A2ADelegationStartedEvent received: task={getattr(event, 'task_description', 'unknown')}")
                 self._handle_event(event)
 
             @bus.on(A2ADelegationCompletedEvent)
             def on_a2a_delegation_complete(source: Any, event: A2ADelegationCompletedEvent) -> None:
-                logger.debug(f"A2ADelegationCompletedEvent received: status={getattr(event, 'status', 'unknown')}")
                 self._handle_event(event)
 
             @bus.on(A2AConversationStartedEvent)
             def on_a2a_conversation_start(source: Any, event: A2AConversationStartedEvent) -> None:
-                logger.debug(f"A2AConversationStartedEvent received")
                 self._handle_event(event)
 
             @bus.on(A2AConversationCompletedEvent)
             def on_a2a_conversation_complete(source: Any, event: A2AConversationCompletedEvent) -> None:
-                logger.debug(f"A2AConversationCompletedEvent received: status={getattr(event, 'status', 'unknown')}")
                 self._handle_event(event)
 
             @bus.on(A2AMessageSentEvent)
             def on_a2a_message_sent(source: Any, event: A2AMessageSentEvent) -> None:
-                logger.debug(f"A2AMessageSentEvent received: turn={getattr(event, 'turn_number', 0)}")
                 self._handle_event(event)
 
             @bus.on(A2AResponseReceivedEvent)
             def on_a2a_response_received(source: Any, event: A2AResponseReceivedEvent) -> None:
-                logger.debug(f"A2AResponseReceivedEvent received: turn={getattr(event, 'turn_number', 0)}")
                 self._handle_event(event)
 
-            logger.debug("A2A event handlers registered successfully")
-
-        except ImportError as e:
+        except ImportError:
             # A2A events not available in this CrewAI version
-            logger.debug(f"A2A events not available: {e}")
+            pass
 
     def _handle_event(self, event: Any) -> None:
         """Convert and emit a CrewAI event as a trace event.
@@ -543,9 +473,6 @@ class ArzuleCrewAIListener:
         """
         event_class = event.__class__.__name__
         cached_run_id = self._get_cached_run_id()
-        
-        get_logger().debug(f"Event received: {event_class} | cached_run_id={cached_run_id}")
-        
         run = current_run(run_id_hint=cached_run_id)
         if not run:
             log_event_dropped(
@@ -556,7 +483,6 @@ class ArzuleCrewAIListener:
             return
 
         trace_event = evt_from_crewai_event(run, event)
-        get_logger().debug(f"Emitting event: {trace_event.get('event_type')} | run_id={run.run_id}")
         run.emit(trace_event)
 
     def _maybe_inject_delegation_handoff(self, event: Any) -> None:
