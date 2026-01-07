@@ -5,7 +5,7 @@ Lightweight SDK for capturing multi-agent traces and sending them to Arzule.
 **Supported Frameworks:**
 - CrewAI
 - LangChain / LangGraph
-- Microsoft AutoGen
+- Microsoft AutoGen (both legacy v0.2 and new v0.7+)
 
 ## Installation
 
@@ -82,7 +82,7 @@ with ArzuleRun(tenant_id="...", project_id="...", sink=sink) as run:
     result = agent.invoke({"input": "..."}, config={"callbacks": [handler]})
 ```
 
-### Microsoft AutoGen
+### Microsoft AutoGen (Legacy v0.2)
 
 ```python
 from arzule_ingest import ArzuleRun
@@ -90,7 +90,7 @@ from arzule_ingest.sinks import JsonlFileSink
 from arzule_ingest.autogen import instrument_autogen
 from autogen import AssistantAgent, UserProxyAgent
 
-# Instrument AutoGen (call once at startup)
+# Instrument AutoGen v0.2 (call once at startup)
 instrument_autogen()
 
 # Create your agents
@@ -102,6 +102,33 @@ sink = JsonlFileSink("traces/output.jsonl")
 with ArzuleRun(tenant_id="...", project_id="...", sink=sink) as run:
     user_proxy.initiate_chat(assistant, message="Hello!")
 ```
+
+### Microsoft AutoGen v0.7+ (New Architecture)
+
+```python
+import asyncio
+import arzule_ingest
+
+# Initialize (automatically detects and instruments v0.7+)
+arzule_ingest.init()
+
+from autogen_agentchat.agents import AssistantAgent
+from autogen_ext.models.openai import OpenAIChatCompletionClient
+
+async def main():
+    model_client = OpenAIChatCompletionClient(model="gpt-4o-mini")
+    agent = AssistantAgent("assistant", model_client=model_client)
+    
+    # Run task - automatically traced
+    result = await agent.run(task="What is 2 + 2?")
+    print(result.messages[-1].to_text())
+    
+    await model_client.close()
+
+asyncio.run(main())
+```
+
+**Note:** The SDK automatically detects which version of AutoGen you have installed. For detailed AutoGen v0.7+ documentation, see [AUTOGEN_V2_INTEGRATION.md](AUTOGEN_V2_INTEGRATION.md).
 
 ## What Gets Captured
 
@@ -123,11 +150,13 @@ The SDK automatically captures framework-specific events:
 - **Agent actions** - `agent.action`, `agent.finish`
 - **Retriever calls** - `retriever.start`, `retriever.end`
 
-### AutoGen
+### AutoGen (v0.2 and v0.7+)
 - **Messages** - `agent.message.send`, `agent.message.receive`
+- **Agent lifecycle** - `agent.start`, `agent.end`
 - **Conversations** - `conversation.start`, `conversation.end`
-- **Code execution** - `code.execution`
+- **Code execution** - `code.execution` (v0.2 only)
 - **Handoffs** - `handoff.proposed`, `handoff.ack`, `handoff.complete`
+- **Agent events** - `agent.event` (v0.7+ only)
 
 ## TraceEvent Format
 

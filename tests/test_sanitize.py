@@ -48,12 +48,75 @@ class TestRedactPii:
         assert "john.doe@example.com" not in result
         assert "[PII_REDACTED]" in result
 
-    def test_redacts_phone(self):
-        """Test that phone numbers are redacted."""
+    def test_redacts_phone_us(self):
+        """Test that US phone numbers are redacted."""
         text = "Call me at 555-123-4567"
         result = redact_pii(text)
         assert "555-123-4567" not in result
         assert "[PII_REDACTED]" in result
+
+    def test_redacts_phone_us_with_country_code(self):
+        """Test that US phone with country code is redacted."""
+        text = "Call me at +1-555-123-4567"
+        result = redact_pii(text)
+        assert "555-123-4567" not in result
+        assert "[PII_REDACTED]" in result
+
+    def test_redacts_phone_international(self):
+        """Test that international phone numbers are redacted."""
+        text = "Call UK at +44 20 7946 0958"
+        result = redact_pii(text)
+        assert "+44 20 7946 0958" not in result
+        assert "[PII_REDACTED]" in result
+
+    def test_redacts_ssn(self):
+        """Test that SSN is redacted."""
+        text = "SSN: 123-45-6789"
+        result = redact_pii(text)
+        assert "123-45-6789" not in result
+        assert "[PII_REDACTED]" in result
+
+    def test_redacts_credit_card(self):
+        """Test that credit card numbers are redacted."""
+        text = "Card: 4111-1111-1111-1111"
+        result = redact_pii(text)
+        assert "4111-1111-1111-1111" not in result
+        assert "[PII_REDACTED]" in result
+
+    def test_redacts_credit_card_spaces(self):
+        """Test that credit card with spaces is redacted."""
+        text = "Card: 4111 1111 1111 1111"
+        result = redact_pii(text)
+        assert "4111 1111 1111 1111" not in result
+        assert "[PII_REDACTED]" in result
+
+    def test_redacts_ipv4(self):
+        """Test that IPv4 addresses are redacted."""
+        text = "User IP: 192.168.1.100"
+        result = redact_pii(text)
+        assert "192.168.1.100" not in result
+        assert "[PII_REDACTED]" in result
+
+    def test_redacts_dob(self):
+        """Test that date of birth is redacted when marked."""
+        text = "DOB: 01/15/1990"
+        result = redact_pii(text)
+        assert "01/15/1990" not in result
+        assert "[PII_REDACTED]" in result
+
+    def test_redacts_zip_with_context(self):
+        """Test that ZIP codes are redacted when marked."""
+        text = "ZIP: 90210"
+        result = redact_pii(text)
+        assert "90210" not in result
+        assert "[PII_REDACTED]" in result
+
+    def test_preserves_normal_numbers(self):
+        """Test that normal numbers are not redacted as ZIP codes."""
+        # Bare 5-digit numbers should NOT be redacted (too many false positives)
+        text = "Error code 12345 occurred"
+        result = redact_pii(text)
+        assert "12345" in result  # Should be preserved
 
     def test_preserves_normal_text(self):
         """Test that normal text is preserved."""
@@ -106,6 +169,23 @@ class TestSanitize:
 
         assert result[0]["token"] == "<redacted>"
         assert result[1]["value"] == 123
+
+    def test_sanitizes_pii_sensitive_keys(self):
+        """Test that PII-related keys are redacted."""
+        payload = {
+            "ssn": "123-45-6789",
+            "credit_card": "4111111111111111",
+            "date_of_birth": "1990-01-15",
+            "passport_number": "AB1234567",
+            "name": "John Doe",  # Should be preserved (common field)
+        }
+        result = sanitize(payload, redact=True)
+
+        assert result["ssn"] == "<redacted>"
+        assert result["credit_card"] == "<redacted>"
+        assert result["date_of_birth"] == "<redacted>"
+        assert result["passport_number"] == "<redacted>"
+        assert result["name"] == "John Doe"  # Names are preserved for debugging
 
     def test_handles_bytes(self):
         """Test that bytes are converted to placeholder."""

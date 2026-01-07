@@ -19,6 +19,149 @@ def _safe_getattr(obj: Any, attr: str, default: Any = None) -> Any:
         return default
 
 
+def _extract_token_usage(response: Any) -> Dict[str, Any]:
+    """Extract token usage from LLM response.
+    
+    Supports multiple formats from different LLM providers:
+    - OpenAI/LiteLLM: response.usage.{prompt_tokens, completion_tokens, total_tokens}
+    - LangChain LLMResult: response.llm_output["token_usage"]
+    - usage_metadata: response.usage_metadata.{input_tokens, output_tokens}
+    - Generations with usage: response.generations[0][0].generation_info["usage"]
+    
+    Returns:
+        Dict with prompt_tokens, completion_tokens, total_tokens (may be empty)
+    """
+    if not response:
+        return {}
+    
+    result: Dict[str, Any] = {}
+    
+    # Try response.usage (OpenAI/LiteLLM format)
+    usage = _safe_getattr(response, "usage", None)
+    if usage:
+        prompt = _safe_getattr(usage, "prompt_tokens", None)
+        completion = _safe_getattr(usage, "completion_tokens", None)
+        total = _safe_getattr(usage, "total_tokens", None)
+        
+        # Also check for input_tokens/output_tokens naming (Anthropic, etc.)
+        if prompt is None:
+            prompt = _safe_getattr(usage, "input_tokens", None)
+        if completion is None:
+            completion = _safe_getattr(usage, "output_tokens", None)
+        
+        if prompt is not None:
+            result["prompt_tokens"] = int(prompt)
+        if completion is not None:
+            result["completion_tokens"] = int(completion)
+        if total is not None:
+            result["total_tokens"] = int(total)
+        elif prompt is not None and completion is not None:
+            result["total_tokens"] = int(prompt) + int(completion)
+    
+    # Try response.llm_output["token_usage"] (LangChain LLMResult format)
+    if not result:
+        llm_output = _safe_getattr(response, "llm_output", None)
+        if llm_output and isinstance(llm_output, dict):
+            token_usage = llm_output.get("token_usage", {})
+            if token_usage:
+                if "prompt_tokens" in token_usage:
+                    result["prompt_tokens"] = int(token_usage["prompt_tokens"])
+                if "completion_tokens" in token_usage:
+                    result["completion_tokens"] = int(token_usage["completion_tokens"])
+                if "total_tokens" in token_usage:
+                    result["total_tokens"] = int(token_usage["total_tokens"])
+    
+    # Try response.usage_metadata (some LangChain providers)
+    if not result:
+        usage_meta = _safe_getattr(response, "usage_metadata", None)
+        if usage_meta:
+            input_tokens = _safe_getattr(usage_meta, "input_tokens", None)
+            output_tokens = _safe_getattr(usage_meta, "output_tokens", None)
+            total_tokens = _safe_getattr(usage_meta, "total_tokens", None)
+            
+            if input_tokens is not None:
+                result["prompt_tokens"] = int(input_tokens)
+            if output_tokens is not None:
+                result["completion_tokens"] = int(output_tokens)
+            if total_tokens is not None:
+                result["total_tokens"] = int(total_tokens)
+            elif input_tokens is not None and output_tokens is not None:
+                result["total_tokens"] = int(input_tokens) + int(output_tokens)
+    
+    # Try generations[0][0].generation_info (some LangChain LLMResults)
+    if not result:
+        generations = _safe_getattr(response, "generations", None)
+        if generations and isinstance(generations, list) and len(generations) > 0:
+            first_gen_list = generations[0]
+            if isinstance(first_gen_list, list) and len(first_gen_list) > 0:
+                first_gen = first_gen_list[0]
+                gen_info = _safe_getattr(first_gen, "generation_info", None)
+                if gen_info and isinstance(gen_info, dict):
+                    usage = gen_info.get("usage", {})
+                    if usage:
+                        if "prompt_tokens" in usage:
+                            result["prompt_tokens"] = int(usage["prompt_tokens"])
+                        if "completion_tokens" in usage:
+                            result["completion_tokens"] = int(usage["completion_tokens"])
+                        if "total_tokens" in usage:
+                            result["total_tokens"] = int(usage["total_tokens"])
+    
+    # Try generations[0][0].message.usage_metadata (ChatGeneration with AIMessage)
+    # This is the PRIMARY location for newer LangChain versions
+    if not result:
+        generations = _safe_getattr(response, "generations", None)
+        if generations and isinstance(generations, list) and len(generations) > 0:
+            first_gen_list = generations[0]
+            if isinstance(first_gen_list, list) and len(first_gen_list) > 0:
+                first_gen = first_gen_list[0]
+                # Get the message from ChatGeneration
+                message = _safe_getattr(first_gen, "message", None)
+                if message:
+                    # Try message.usage_metadata (preferred in newer LangChain)
+                    usage_meta = _safe_getattr(message, "usage_metadata", None)
+                    if usage_meta:
+                        input_tokens = _safe_getattr(usage_meta, "input_tokens", None)
+                        output_tokens = _safe_getattr(usage_meta, "output_tokens", None)
+                        total_tokens = _safe_getattr(usage_meta, "total_tokens", None)
+                        
+                        # Also try dict access for usage_metadata
+                        if input_tokens is None and isinstance(usage_meta, dict):
+                            input_tokens = usage_meta.get("input_tokens")
+                            output_tokens = usage_meta.get("output_tokens")
+                            total_tokens = usage_meta.get("total_tokens")
+                        
+                        if input_tokens is not None:
+                            result["prompt_tokens"] = int(input_tokens)
+                        if output_tokens is not None:
+                            result["completion_tokens"] = int(output_tokens)
+                        if total_tokens is not None:
+                            result["total_tokens"] = int(total_tokens)
+                        elif input_tokens is not None and output_tokens is not None:
+                            result["total_tokens"] = int(input_tokens) + int(output_tokens)
+    
+    # Try generations[0][0].message.response_metadata["token_usage"] (alternate location)
+    if not result:
+        generations = _safe_getattr(response, "generations", None)
+        if generations and isinstance(generations, list) and len(generations) > 0:
+            first_gen_list = generations[0]
+            if isinstance(first_gen_list, list) and len(first_gen_list) > 0:
+                first_gen = first_gen_list[0]
+                message = _safe_getattr(first_gen, "message", None)
+                if message:
+                    response_meta = _safe_getattr(message, "response_metadata", None)
+                    if response_meta and isinstance(response_meta, dict):
+                        token_usage = response_meta.get("token_usage", {})
+                        if token_usage:
+                            if "prompt_tokens" in token_usage:
+                                result["prompt_tokens"] = int(token_usage["prompt_tokens"])
+                            if "completion_tokens" in token_usage:
+                                result["completion_tokens"] = int(token_usage["completion_tokens"])
+                            if "total_tokens" in token_usage:
+                                result["total_tokens"] = int(token_usage["total_tokens"])
+    
+    return result
+
+
 def _extract_chain_name(serialized: Optional[Dict[str, Any]]) -> str:
     """Extract chain/runnable name from serialized data."""
     if not serialized:
@@ -111,10 +254,11 @@ def evt_llm_start(
     model_name = _extract_llm_name(serialized)
     prompts = prompts or []
 
-    # Truncate prompts for payload
-    truncated_prompts = [truncate_string(p, 1000) for p in prompts[:5]]
-    if len(prompts) > 5:
-        truncated_prompts.append(f"... and {len(prompts) - 5} more prompts")
+    # Keep full prompts (up to 50k chars each) - important for debugging
+    # Apply sanitization to redact secrets and PII from user prompts
+    truncated_prompts = [sanitize(truncate_string(p, 50_000)) for p in prompts[:10]]
+    if len(prompts) > 10:
+        truncated_prompts.append(f"... and {len(prompts) - 10} more prompts")
 
     return {
         **_base(run, span_id=span_id, parent_span_id=parent_span_id),
@@ -141,22 +285,22 @@ def evt_llm_end(
     response: Any,
 ) -> Dict[str, Any]:
     """Create event for LLM call end."""
-    # Extract response content
+    # Extract response content - keep full generations for debugging
     generations = []
-    token_usage = {}
 
     if hasattr(response, "generations"):
-        for gen_list in response.generations[:3]:
+        for gen_list in response.generations[:5]:
             if isinstance(gen_list, list):
-                for gen in gen_list[:2]:
+                for gen in gen_list[:3]:
                     text = _safe_getattr(gen, "text", str(gen))
-                    generations.append(truncate_string(text, 500))
+                    # Apply sanitization to redact secrets and PII from LLM responses
+                    generations.append(sanitize(truncate_string(text, 50_000)))
             else:
                 text = _safe_getattr(gen_list, "text", str(gen_list))
-                generations.append(truncate_string(text, 500))
+                generations.append(sanitize(truncate_string(text, 50_000)))
 
-    if hasattr(response, "llm_output") and response.llm_output:
-        token_usage = response.llm_output.get("token_usage", {})
+    # Extract token usage using robust multi-format extraction
+    token_usage = _extract_token_usage(response)
 
     return {
         **_base(run, span_id=span_id, parent_span_id=parent_span_id),
@@ -172,7 +316,7 @@ def evt_llm_end(
         },
         "payload": {
             "generations": generations,
-            "token_usage": token_usage,
+            "token_usage": token_usage if token_usage else None,
         },
     }
 
@@ -304,7 +448,7 @@ def evt_tool_start(
             "tags": tags,
         },
         "payload": {
-            "tool_input": truncate_string(input_str, 1000),
+            "tool_input": sanitize(truncate_string(input_str, 20_000)),
             "metadata": sanitize(metadata) if metadata else {},
         },
     }
@@ -327,7 +471,7 @@ def evt_tool_end(
         "summary": "tool completed",
         "attrs_compact": {},
         "payload": {
-            "tool_output": truncate_string(output_str, 1000),
+            "tool_output": sanitize(truncate_string(output_str, 20_000)),
         },
     }
 
@@ -458,7 +602,7 @@ def evt_agent_action(
         },
         "payload": {
             "tool_input": sanitize(tool_input),
-            "log": truncate_string(log, 500),
+            "log": sanitize(truncate_string(log, 500)),
             "metadata": sanitize(metadata) if metadata else {},
         },
     }
@@ -491,7 +635,7 @@ def evt_agent_finish(
         },
         "payload": {
             "return_values": sanitize(return_values),
-            "log": truncate_string(log, 500),
+            "log": sanitize(truncate_string(log, 500)),
             "metadata": sanitize(metadata) if metadata else {},
         },
     }
@@ -526,7 +670,7 @@ def evt_retriever_start(
             "tags": tags,
         },
         "payload": {
-            "query": truncate_string(query, 500),
+            "query": sanitize(truncate_string(query, 500)),
             "metadata": sanitize(metadata) if metadata else {},
         },
     }
@@ -547,7 +691,7 @@ def evt_retriever_end(
         page_content = _safe_getattr(doc, "page_content", str(doc))
         doc_metadata = _safe_getattr(doc, "metadata", {})
         doc_summaries.append({
-            "content_preview": truncate_string(page_content, 200),
+            "content_preview": sanitize(truncate_string(page_content, 200)),
             "metadata": sanitize(doc_metadata),
         })
 

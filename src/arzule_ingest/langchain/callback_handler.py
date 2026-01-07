@@ -115,7 +115,7 @@ class ArzuleLangChainHandler(_BASE_CLASS):
             return self._cached_run_id
 
     def _get_run_with_fallback(self, callback_name: str) -> Optional["ArzuleRun"]:
-        """Get run from ContextVar, falling back to cached run_id.
+        """Get run from ContextVar, falling back to cached run_id or ensure_run().
         
         Args:
             callback_name: Name of the callback (for logging if dropped)
@@ -136,6 +136,20 @@ class ArzuleLangChainHandler(_BASE_CLASS):
             run = current_run(run_id_hint=cached_id)
             if run:
                 return run
+        
+        # LangChain-specific: ensure a run exists (lazy creation)
+        # This is needed when LangChain is used standalone (not via CrewAI)
+        # or when LangGraph callbacks fire before CrewAI starts
+        try:
+            import arzule_ingest
+            run_id = arzule_ingest.ensure_run()
+            if run_id:
+                run = current_run(run_id_hint=run_id)
+                if run:
+                    self._cache_run_id(run.run_id)
+                    return run
+        except Exception:
+            pass
         
         # Log the drop (only if we had a cached_id, meaning we were expecting a run)
         if cached_id:

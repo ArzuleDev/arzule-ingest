@@ -6,13 +6,13 @@ import atexit
 import os
 import sys
 import threading
-from typing import Optional
+from typing import Any, Optional
 
 from .run import ArzuleRun, current_run
 from .config import ArzuleConfig
 from .audit import AuditLogger, audit_log
 
-__version__ = "0.6.2"
+__version__ = "0.7.11"
 __all__ = [
     "ArzuleRun",
     "current_run",
@@ -27,7 +27,7 @@ __all__ = [
 
 # Global state
 _initialized = False
-_global_sink: Optional["TelemetrySink"] = None
+_global_sink: Optional[Any] = None  # TelemetrySink type
 _global_run: Optional[ArzuleRun] = None
 _config: Optional[dict] = None
 _run_lock = threading.Lock()  # Thread-safe lock for new_run()
@@ -59,10 +59,39 @@ def _check_langchain_available() -> bool:
             return False
 
 
-def _check_autogen_available() -> bool:
-    """Check if Microsoft AutoGen is installed."""
+def _check_autogen_available() -> tuple[bool, str]:
+    """Check if Microsoft AutoGen is installed and which version.
+    
+    Returns:
+        Tuple of (is_available, version_type) where version_type is:
+        - "v2" for AutoGen v0.7+ (autogen-core, autogen-agentchat)
+        - "v0.2" for legacy AutoGen (pyautogen)
+        - "" if not available
+    """
+    # Check for new AutoGen v0.7+ first
+    try:
+        import autogen_core  # noqa: F401
+        import autogen_agentchat  # noqa: F401
+        return True, "v2"
+    except ImportError:
+        pass
+    
+    # Check for legacy AutoGen v0.2
     try:
         import autogen  # noqa: F401
+        # Make sure it's the old version, not a namespace package
+        if hasattr(autogen, 'ConversableAgent'):
+            return True, "v0.2"
+    except ImportError:
+        pass
+    
+    return False, ""
+
+
+def _check_langgraph_available() -> bool:
+    """Check if LangGraph is installed."""
+    try:
+        import langgraph  # noqa: F401
         return True
     except ImportError:
         return False
@@ -89,7 +118,7 @@ def init(
         tenant_id: Tenant ID. Defaults to ARZULE_TENANT_ID env var.
         project_id: Project ID. Defaults to ARZULE_PROJECT_ID env var.
         ingest_url: Backend URL. Defaults to ARZULE_INGEST_URL or Arzule cloud.
-        auto_instrument: If True, automatically instruments CrewAI/LangChain (if installed).
+        auto_instrument: If True, automatically instruments CrewAI/LangChain/LangGraph/AutoGen (if installed).
         require_tls: If True, requires HTTPS (recommended for production).
 
     Returns:
@@ -174,14 +203,30 @@ def init(
             # LangChain integration not available, that's ok
             print("[arzule] LangChain not installed, skipping auto-instrumentation", file=sys.stderr)
 
-    # Auto-instrument AutoGen if available
-    if auto_instrument and _check_autogen_available():
+    # Auto-instrument AutoGen if available (detect version)
+    autogen_available, autogen_version = _check_autogen_available()
+    if auto_instrument and autogen_available:
+        if autogen_version == "v2":
+            try:
+                from .autogen_v2.install import instrument_autogen_v2
+                instrument_autogen_v2()
+            except ImportError as e:
+                print(f"[arzule] AutoGen v0.7+ installed but integration failed: {e}", file=sys.stderr)
+        elif autogen_version == "v0.2":
+            try:
+                from .autogen.install import instrument_autogen
+                instrument_autogen()
+            except ImportError as e:
+                print(f"[arzule] AutoGen v0.2 installed but integration failed: {e}", file=sys.stderr)
+
+    # Auto-instrument LangGraph if available
+    if auto_instrument and _check_langgraph_available():
         try:
-            from .autogen.install import instrument_autogen
-            instrument_autogen()
+            from .langgraph.install import instrument_langgraph
+            instrument_langgraph()
         except ImportError:
-            # AutoGen integration not available, that's ok
-            print("[arzule] AutoGen not installed, skipping auto-instrumentation", file=sys.stderr)
+            # LangGraph integration not available, that's ok
+            print("[arzule] LangGraph not installed, skipping auto-instrumentation", file=sys.stderr)
 
     _config = {
         "tenant_id": tenant_id,

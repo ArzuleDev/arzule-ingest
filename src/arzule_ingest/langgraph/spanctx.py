@@ -1,4 +1,4 @@
-"""Span context management for LangChain instrumentation."""
+"""Span context management for LangGraph instrumentation."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 
 # Context variable for the current span stack (per-async-context)
-_span_stack: ContextVar[list[str]] = ContextVar("_langchain_span_stack", default=[])
+_span_stack: ContextVar[list[str]] = ContextVar("_langgraph_span_stack", default=[])
 
 
 def get_current_span_id() -> Optional[str]:
@@ -33,7 +33,7 @@ def start_child_span(run: "ArzuleRun", kind: str, name: str) -> str:
 
     Args:
         run: The active ArzuleRun
-        kind: Span kind (e.g., "chain", "llm", "tool", "agent")
+        kind: Span kind (e.g., "graph", "node", "checkpoint")
         name: Human-readable span name
 
     Returns:
@@ -59,11 +59,10 @@ def end_span(run: "ArzuleRun", span_id: Optional[str] = None) -> Optional[str]:
     if span_id and popped and popped != span_id:
         import sys
         print(
-            f"[arzule] LangChain span mismatch: expected {span_id}, got {popped}",
+            f"[arzule] LangGraph span mismatch: expected {span_id}, got {popped}",
             file=sys.stderr,
         )
     return popped
-
 
 
 

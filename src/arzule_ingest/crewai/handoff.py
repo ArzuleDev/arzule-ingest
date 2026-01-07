@@ -13,6 +13,10 @@ from ..ids import new_span_id
 if TYPE_CHECKING:
     from ..run import ArzuleRun
 
+# Maximum size for delegation result payload
+# Matches the semantic analyzer's LLM context capacity
+MAX_DELEGATION_RESULT_CHARS = 100_000
+
 
 def _compute_payload_hash(payload: Any) -> Optional[str]:
     """
@@ -352,10 +356,10 @@ def emit_handoff_complete(
     
     # Include the result
     if result_payload is not None:
-        # Truncate if too large
+        # Truncate if too large (limit matches semantic analyzer capacity)
         result_str = str(result_payload)
-        if len(result_str) > 2000:
-            payload["result"] = result_str[:2000] + "..."
+        if len(result_str) > MAX_DELEGATION_RESULT_CHARS:
+            payload["result"] = result_str[:MAX_DELEGATION_RESULT_CHARS] + "..."
         else:
             payload["result"] = result_str
     elif result_summary:
