@@ -56,6 +56,10 @@ class ArzuleCrewAIListener:
         # Key: (run_id, tool_name, agent_role) -> {handoff_key, tool_input}
         self._pending_delegation_tools: dict[tuple[str, str, Optional[str]], dict[str, Any]] = {}
         self._pending_delegation_lock = threading.Lock()
+        # Track last seen token usage per LLM instance to compute deltas
+        # Key: id(llm_instance) -> {prompt_tokens, completion_tokens, total_tokens}
+        self._last_llm_token_usage: dict[int, dict[str, int]] = {}
+        self._llm_token_lock = threading.Lock()
 
     def _cache_run_id(self, run_id: str) -> None:
         """Cache the run_id for thread-safe fallback lookup.
@@ -245,7 +249,11 @@ class ArzuleCrewAIListener:
 
             @bus.on(LLMCallCompletedEvent)
             def on_llm_complete(source: Any, event: LLMCallCompletedEvent) -> None:
-                self._handle_event(event)
+                # Extract token usage delta from the LLM source instance
+                token_delta = self._extract_llm_token_delta(source)
+                if token_delta:
+                    logger.info(f"[arzule] LLM call used {token_delta.get('total_tokens', 0)} tokens (prompt: {token_delta.get('prompt_tokens', 0)}, completion: {token_delta.get('completion_tokens', 0)})")
+                self._handle_event(event, llm_token_usage=token_delta)
 
             @bus.on(LLMCallFailedEvent)
             def on_llm_failed(source: Any, event: LLMCallFailedEvent) -> None:
@@ -477,11 +485,66 @@ class ArzuleCrewAIListener:
             # A2A events not available in this CrewAI version
             pass
 
-    def _handle_event(self, event: Any) -> None:
+    def _extract_llm_token_delta(self, llm_source: Any) -> Optional[dict[str, int]]:
+        """Extract token usage delta from an LLM instance.
+        
+        CrewAI's LLM instances track cumulative token usage in _token_usage.
+        This method computes the delta since the last call by tracking
+        the previous values per LLM instance.
+        
+        Args:
+            llm_source: The LLM instance that emitted the event
+            
+        Returns:
+            Dict with prompt_tokens, completion_tokens, total_tokens delta,
+            or None if token usage is not available.
+        """
+        if llm_source is None:
+            return None
+            
+        # Try to access the internal _token_usage dict
+        token_usage = getattr(llm_source, "_token_usage", None)
+        if not token_usage or not isinstance(token_usage, dict):
+            return None
+            
+        llm_id = id(llm_source)
+        current = {
+            "prompt_tokens": token_usage.get("prompt_tokens", 0),
+            "completion_tokens": token_usage.get("completion_tokens", 0),
+            "total_tokens": token_usage.get("total_tokens", 0),
+        }
+        
+        with self._llm_token_lock:
+            last = self._last_llm_token_usage.get(llm_id, {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            })
+            
+            # Compute delta
+            delta = {
+                "prompt_tokens": current["prompt_tokens"] - last["prompt_tokens"],
+                "completion_tokens": current["completion_tokens"] - last["completion_tokens"],
+                "total_tokens": current["total_tokens"] - last["total_tokens"],
+            }
+            
+            # Update last seen values
+            self._last_llm_token_usage[llm_id] = current
+            
+        # Only return if we have actual token usage
+        if delta["total_tokens"] > 0 or delta["prompt_tokens"] > 0 or delta["completion_tokens"] > 0:
+            return delta
+        return None
+
+    def _handle_event(self, event: Any, llm_token_usage: Optional[dict[str, int]] = None) -> None:
         """Convert and emit a CrewAI event as a trace event.
         
         Uses cached run_id for thread fallback when ContextVar fails
         (e.g., in CrewAI-spawned worker threads for concurrent tasks).
+        
+        Args:
+            event: The CrewAI event to convert and emit
+            llm_token_usage: Optional token usage delta for LLM events
         """
         event_class = event.__class__.__name__
         cached_run_id = self._get_cached_run_id()
@@ -494,7 +557,7 @@ class ArzuleCrewAIListener:
             )
             return
 
-        trace_event = evt_from_crewai_event(run, event)
+        trace_event = evt_from_crewai_event(run, event, llm_token_usage=llm_token_usage)
         run.emit(trace_event)
 
     def _maybe_inject_delegation_handoff(self, event: Any) -> None:

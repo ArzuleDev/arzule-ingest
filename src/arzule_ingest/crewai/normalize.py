@@ -441,6 +441,7 @@ def evt_from_crewai_event(
     *,
     parent_span_id: Optional[str] = None,
     task_key: Optional[str] = None,
+    llm_token_usage: Optional[dict[str, int]] = None,
 ) -> dict[str, Any]:
     """
     Convert a CrewAI event bus event to a TraceEvent.
@@ -450,6 +451,7 @@ def evt_from_crewai_event(
         event: CrewAI event object
         parent_span_id: Optional explicit parent span (for concurrent task tracking)
         task_key: Optional task key for correlation in concurrent mode
+        llm_token_usage: Optional token usage dict for LLM call events
 
     Returns:
         TraceEvent dict
@@ -584,11 +586,11 @@ def evt_from_crewai_event(
 
     result = _safe_getattr(event, "result", None)
     if result is not None:
-        payload["result"] = truncate_string(str(result), 1000)
+        payload["result"] = sanitize(truncate_string(str(result), 1000))
 
     output = _safe_getattr(event, "output", None)
     if output is not None:
-        payload["output"] = truncate_string(str(output), 1000)
+        payload["output"] = sanitize(truncate_string(str(output), 1000))
 
     error = _safe_getattr(event, "error", None)
     if error is not None:
@@ -634,12 +636,44 @@ def evt_from_crewai_event(
         if task_details.get("output_file"):
             attrs["task_output_file"] = task_details["output_file"]
 
+    # Crew/Flow inputs - capture kickoff inputs for goal extraction
+    # This works for both CrewKickoffStartedEvent and FlowStartedEvent
+    event_inputs = _safe_getattr(event, "inputs", None)
+    if event_inputs is not None:
+        # Try to extract a meaningful goal from inputs
+        if isinstance(event_inputs, dict):
+            # Store dict inputs in payload for backend query access
+            payload["inputs"] = sanitize(event_inputs)
+            # Common patterns: inputs might have 'goal', 'topic', 'task', 'query', 'question', etc.
+            goal_value = (
+                event_inputs.get("goal") or
+                event_inputs.get("topic") or
+                event_inputs.get("task") or
+                event_inputs.get("query") or
+                event_inputs.get("question") or
+                event_inputs.get("objective") or
+                event_inputs.get("prompt") or
+                event_inputs.get("input")
+            )
+            if goal_value:
+                # Apply sanitization to redact secrets and PII from goal/user input
+                payload["goal"] = sanitize(truncate_string(str(goal_value), 500))
+            # If no standard key found but dict has values, use first string value
+            elif not payload.get("goal"):
+                for v in event_inputs.values():
+                    if isinstance(v, str) and len(v) > 5:
+                        payload["goal"] = sanitize(truncate_string(v, 500))
+                        break
+        elif isinstance(event_inputs, str) and len(event_inputs) > 5:
+            # String inputs go directly to goal, not stored in payload["inputs"]
+            # to avoid type mismatch in backend SQL queries expecting JSONB object
+            payload["goal"] = sanitize(truncate_string(event_inputs, 500))
+
     # Flow event info (for multi-crew orchestration)
     flow_name = _safe_getattr(event, "flow_name", None)
     method_name = _safe_getattr(event, "method_name", None)
     flow_state = _safe_getattr(event, "state", None)
     flow_params = _safe_getattr(event, "params", None)
-    flow_inputs = _safe_getattr(event, "inputs", None)
     flow_id = _safe_getattr(event, "flow_id", None)
     
     if flow_name:
@@ -673,10 +707,6 @@ def evt_from_crewai_event(
     if flow_params is not None:
         payload["flow_params"] = sanitize(flow_params)
     
-    # Flow inputs (for FlowStartedEvent)
-    if flow_inputs is not None:
-        payload["flow_inputs"] = sanitize(flow_inputs)
-    
     # Human feedback events (HITL)
     feedback_message = _safe_getattr(event, "message", None)
     feedback_text = _safe_getattr(event, "feedback", None)
@@ -684,9 +714,9 @@ def evt_from_crewai_event(
     feedback_emit = _safe_getattr(event, "emit", None)
     
     if feedback_message:
-        attrs["feedback_message"] = truncate_string(feedback_message, 200)
+        attrs["feedback_message"] = sanitize(truncate_string(feedback_message, 200))
     if feedback_text:
-        payload["feedback"] = truncate_string(feedback_text, 1000)
+        payload["feedback"] = sanitize(truncate_string(feedback_text, 1000))
     if feedback_outcome:
         attrs["feedback_outcome"] = feedback_outcome
     if feedback_emit:
@@ -725,12 +755,19 @@ def evt_from_crewai_event(
         content = _safe_getattr(response, "content", None)
         if content is None:
             content = str(response)
-        payload["response"] = truncate_string(str(content), 2000)
+        # Apply sanitization to redact secrets and PII from LLM responses
+        payload["response"] = sanitize(truncate_string(str(content), 2000))
         
         # Extract token usage from LLM response (LiteLLM/OpenAI format)
+        # First try the response object itself
         token_usage = _extract_token_usage(response)
         if token_usage:
             attrs.update(token_usage)
+    
+    # Use passed-in token usage from LLM source if available (preferred)
+    # This comes from CrewAI's internal _token_usage tracking
+    if llm_token_usage:
+        attrs.update(llm_token_usage)
 
     # LLM model info
     model = _safe_getattr(event, "model", None)
@@ -750,7 +787,7 @@ def evt_from_crewai_event(
     memory_retrieval_time = _safe_getattr(event, "retrieval_time_ms", None)
     
     if memory_query and "memory" in event_type:
-        attrs["memory_query"] = truncate_string(memory_query, 200)
+        attrs["memory_query"] = sanitize(truncate_string(memory_query, 200))
     if memory_limit is not None:
         attrs["memory_limit"] = memory_limit
     if memory_score_threshold is not None:
@@ -760,13 +797,13 @@ def evt_from_crewai_event(
     if memory_query_time is not None:
         attrs["memory_query_time_ms"] = memory_query_time
     if memory_value:
-        payload["memory_value"] = truncate_string(memory_value, 500)
+        payload["memory_value"] = sanitize(truncate_string(memory_value, 500))
     if memory_metadata:
         payload["memory_metadata"] = sanitize(memory_metadata)
     if memory_save_time is not None:
         attrs["memory_save_time_ms"] = memory_save_time
     if memory_content:
-        payload["memory_content"] = truncate_string(memory_content, 1000)
+        payload["memory_content"] = sanitize(truncate_string(memory_content, 1000))
     if memory_retrieval_time is not None:
         attrs["memory_retrieval_time_ms"] = memory_retrieval_time
 
@@ -776,11 +813,11 @@ def evt_from_crewai_event(
     knowledge_retrieved = _safe_getattr(event, "retrieved_knowledge", None)
     
     if knowledge_query and "knowledge" in event_type:
-        attrs["knowledge_query"] = truncate_string(knowledge_query, 200)
+        attrs["knowledge_query"] = sanitize(truncate_string(knowledge_query, 200))
     if knowledge_task_prompt:
-        payload["knowledge_task_prompt"] = truncate_string(knowledge_task_prompt, 500)
+        payload["knowledge_task_prompt"] = sanitize(truncate_string(knowledge_task_prompt, 500))
     if knowledge_retrieved:
-        payload["knowledge_retrieved"] = truncate_string(knowledge_retrieved, 1000)
+        payload["knowledge_retrieved"] = sanitize(truncate_string(knowledge_retrieved, 1000))
 
     # A2A (Agent-to-Agent) delegation event info
     if "a2a" in event_type:
@@ -818,17 +855,17 @@ def evt_from_crewai_event(
             attrs["a2a_agent_role"] = a2a_agent_role
         
         if a2a_task_description:
-            payload["a2a_task_description"] = truncate_string(a2a_task_description, 500)
+            payload["a2a_task_description"] = sanitize(truncate_string(a2a_task_description, 500))
         if a2a_result:
-            payload["a2a_result"] = truncate_string(str(a2a_result), 1000)
+            payload["a2a_result"] = sanitize(truncate_string(str(a2a_result), 1000))
         if a2a_final_result:
-            payload["a2a_final_result"] = truncate_string(str(a2a_final_result), 1000)
+            payload["a2a_final_result"] = sanitize(truncate_string(str(a2a_final_result), 1000))
         if a2a_error:
             attrs["a2a_error"] = truncate_string(str(a2a_error), 200)
         if a2a_message:
-            payload["a2a_message"] = truncate_string(a2a_message, 1000)
+            payload["a2a_message"] = sanitize(truncate_string(a2a_message, 1000))
         if a2a_response:
-            payload["a2a_response"] = truncate_string(a2a_response, 1000)
+            payload["a2a_response"] = sanitize(truncate_string(a2a_response, 1000))
         
         # Update summary for A2A events
         summary_parts = [event_type]
@@ -1070,7 +1107,7 @@ def evt_llm_end(run: "ArzuleRun", context: Any, span_id: Optional[str]) -> dict[
         content = _safe_getattr(response, "content", None)
         if content is None:
             content = str(response)
-        payload["response"] = truncate_string(str(content), 2000)
+        payload["response"] = sanitize(truncate_string(str(content), 2000))
         
         # Extract token usage for per-agent tracking
         token_usage = _extract_token_usage(response)
@@ -1093,7 +1130,7 @@ def evt_llm_end(run: "ArzuleRun", context: Any, span_id: Optional[str]) -> dict[
 
 
 def _truncate_messages(messages: Any, max_messages: int = 10) -> list[dict[str, Any]]:
-    """Truncate message list for payload."""
+    """Truncate and sanitize message list for payload."""
     if not isinstance(messages, list):
         return []
 
@@ -1102,13 +1139,14 @@ def _truncate_messages(messages: Any, max_messages: int = 10) -> list[dict[str, 
         if isinstance(msg, dict):
             result.append({
                 "role": msg.get("role", "unknown"),
-                "content": truncate_string(str(msg.get("content", "")), 500),
+                # Apply sanitization to redact secrets and PII from message content
+                "content": sanitize(truncate_string(str(msg.get("content", "")), 500)),
             })
         else:
             # Try to extract from object
             result.append({
                 "role": _safe_getattr(msg, "role", "unknown"),
-                "content": truncate_string(str(_safe_getattr(msg, "content", msg)), 500),
+                "content": sanitize(truncate_string(str(_safe_getattr(msg, "content", msg)), 500)),
             })
 
     if len(messages) > max_messages:

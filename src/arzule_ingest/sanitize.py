@@ -27,6 +27,23 @@ REDACT_KEYS = {
     "credential",
     "private_key",
     "client_secret",
+    # Additional sensitive keys for PII/financial data
+    "ssn",
+    "social_security",
+    "social_security_number",
+    "credit_card",
+    "card_number",
+    "cvv",
+    "cvc",
+    "date_of_birth",
+    "dob",
+    "passport",
+    "passport_number",
+    "driver_license",
+    "license_number",
+    "bank_account",
+    "routing_number",
+    "account_number",
 }
 
 # Patterns for common secrets in text
@@ -41,12 +58,34 @@ SECRET_PATTERNS = [
 ]
 
 # Common PII patterns - SOC2 requires these to be redacted by default
+# Patterns are ordered from most specific to least specific to avoid over-matching
 PII_PATTERNS = [
-    re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"),  # Email
-    re.compile(r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b"),  # Phone (US)
-    re.compile(r"\b\d{3}[-]?\d{2}[-]?\d{4}\b"),  # SSN
-    re.compile(r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b"),  # Credit card
-    re.compile(r"\b\d{5}(-\d{4})?\b"),  # ZIP code
+    # Credit card numbers (16 digits with optional separators)
+    re.compile(r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b"),
+    
+    # SSN (US Social Security Number: XXX-XX-XXXX)
+    re.compile(r"\b\d{3}[-]\d{2}[-]\d{4}\b"),
+    
+    # Email addresses
+    re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"),
+    
+    # Phone numbers - US format (various separators)
+    re.compile(r"\b(?:\+1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"),
+    
+    # Phone numbers - International format (E.164-like)
+    re.compile(r"\+\d{1,3}[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,4}(?:[-.\s]?\d{1,4})?"),
+    
+    # IP addresses (IPv4) - can identify users/systems
+    re.compile(r"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b"),
+    
+    # Date of birth patterns (common formats that appear with DOB context)
+    # Note: These are contextual - we look for dates near DOB indicators
+    re.compile(r"\b(?:dob|date\s*of\s*birth|birth\s*date)[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b", re.IGNORECASE),
+    re.compile(r"\b(?:dob|date\s*of\s*birth|birth\s*date)[:\s]*(\d{4}[/-]\d{1,2}[/-]\d{1,2})\b", re.IGNORECASE),
+    
+    # US ZIP codes - only match when preceded by zip/postal context to avoid false positives
+    # (bare 5-digit numbers like "12345" are too common in other contexts)
+    re.compile(r"\b(?:zip|postal)[:\s]*\d{5}(?:-\d{4})?\b", re.IGNORECASE),
 ]
 
 # Module-level config cache

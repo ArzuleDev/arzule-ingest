@@ -115,7 +115,7 @@ class ArzuleLangChainHandler(_BASE_CLASS):
             return self._cached_run_id
 
     def _get_run_with_fallback(self, callback_name: str) -> Optional["ArzuleRun"]:
-        """Get run from ContextVar, falling back to cached run_id.
+        """Get run from ContextVar, falling back to cached run_id or ensure_run().
         
         Args:
             callback_name: Name of the callback (for logging if dropped)
@@ -137,6 +137,20 @@ class ArzuleLangChainHandler(_BASE_CLASS):
             if run:
                 return run
         
+        # LangChain-specific: ensure a run exists (lazy creation)
+        # This is needed when LangChain is used standalone (not via CrewAI)
+        # or when LangGraph callbacks fire before CrewAI starts
+        try:
+            import arzule_ingest
+            run_id = arzule_ingest.ensure_run()
+            if run_id:
+                run = current_run(run_id_hint=run_id)
+                if run:
+                    self._cache_run_id(run.run_id)
+                    return run
+        except Exception:
+            pass
+        
         # Log the drop (only if we had a cached_id, meaning we were expecting a run)
         if cached_id:
             log_event_dropped(
@@ -149,6 +163,37 @@ class ArzuleLangChainHandler(_BASE_CLASS):
     def _get_run_key(self, run_id: UUID) -> str:
         """Convert UUID to string key."""
         return str(run_id)
+
+    def _is_internal_routing_channel(self, name: Optional[str], metadata: Optional[Dict[str, Any]]) -> bool:
+        """Check if this is a LangGraph internal routing channel.
+        
+        LangGraph uses internal channels for async execution and routing:
+        - branch:to:* - Conditional edge routing to target nodes
+        - join:* - Barrier synchronization for parallel execution
+        - split:* - Fan-out channels for parallel execution
+        
+        These are infrastructure channels, not actual agent/node executions,
+        and should be filtered out from trace events.
+        """
+        def is_routing_prefix(s: str) -> bool:
+            lower = s.lower()
+            return (
+                lower.startswith("branch:to:")
+                or lower.startswith("join:")
+                or lower.startswith("split:")
+            )
+        
+        # Check name parameter
+        if name and is_routing_prefix(name):
+            return True
+        
+        # Check metadata["langgraph_node"] which may contain the channel name
+        if metadata:
+            langgraph_node = metadata.get("langgraph_node", "")
+            if langgraph_node and is_routing_prefix(langgraph_node):
+                return True
+        
+        return False
 
     def _start_span(self, run_id: UUID) -> str:
         """Create and track a new span for a run."""
@@ -280,10 +325,16 @@ class ArzuleLangChainHandler(_BASE_CLASS):
         parent_run_id: Optional[UUID] = None,
         tags: Optional[List[str]] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        name: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         """Called when chain starts running."""
         if not self.enable_chain:
+            return
+
+        # Skip LangGraph's internal routing channels (branch:to:*, join:*, etc.)
+        # These are infrastructure for async execution and routing, not actual agent nodes
+        if self._is_internal_routing_channel(name, metadata):
             return
 
         run = self._get_run_with_fallback("on_chain_start")
@@ -313,10 +364,16 @@ class ArzuleLangChainHandler(_BASE_CLASS):
         *,
         run_id: UUID,
         parent_run_id: Optional[UUID] = None,
+        name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
         """Called when chain finishes running."""
         if not self.enable_chain:
+            return
+
+        # Skip LangGraph's internal routing channels
+        if self._is_internal_routing_channel(name, metadata):
             return
 
         run = self._get_run_with_fallback("on_chain_end")
@@ -343,10 +400,16 @@ class ArzuleLangChainHandler(_BASE_CLASS):
         *,
         run_id: UUID,
         parent_run_id: Optional[UUID] = None,
+        name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
         """Called when chain errors."""
         if not self.enable_chain:
+            return
+
+        # Skip LangGraph's internal routing channels
+        if self._is_internal_routing_channel(name, metadata):
             return
 
         run = self._get_run_with_fallback("on_chain_error")

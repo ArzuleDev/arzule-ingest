@@ -23,6 +23,26 @@ from ..ids import new_span_id
 if TYPE_CHECKING:
     from ..run import ArzuleRun
 
+# =============================================================================
+# Payload Size Limits
+# =============================================================================
+# These limits control how much content is stored in handoff events.
+# The semantic analyzer (backend) uses these payloads for context drift detection.
+# Limits are set to match the semantic analyzer's LLM context capacity (~100K per field).
+#
+# IMPORTANT: If you see false positive ContextDrift findings where the LLM claims
+# requirements were ignored but the requirements were actually in the truncated portion,
+# consider increasing these limits.
+
+# Maximum size for combined context from multiple sources (implicit_context handoffs)
+MAX_COMBINED_CONTEXT_CHARS = 100_000
+
+# Maximum size for individual context output (sequential handoffs, single sources)
+MAX_CONTEXT_OUTPUT_CHARS = 100_000
+
+# Maximum size for task result/output
+MAX_TASK_RESULT_CHARS = 100_000
+
 # Thread-safe storage for last completed task per run
 # Used to detect sequential agent transitions
 _last_completed_task: dict[str, dict[str, Any]] = {}
@@ -152,10 +172,12 @@ def detect_task_context_handoff(
     span_id: Optional[str] = None,
 ) -> list[str]:
     """
-    Detect implicit handoffs from context tasks and emit handoff.proposed events.
+    Detect implicit handoffs from context tasks and emit a single aggregated handoff.proposed event.
     
-    When a task has context from other tasks, each context task represents
-    an implicit handoff of information. We emit handoff.proposed for each.
+    When a task has context from other tasks, we emit ONE handoff.proposed that includes
+    ALL context sources. This ensures drift detection compares the task output against
+    the complete combined context, avoiding false positives when a task correctly uses
+    data from multiple sources.
     
     Args:
         run: The active ArzuleRun
@@ -163,17 +185,24 @@ def detect_task_context_handoff(
         span_id: The current span ID
         
     Returns:
-        List of handoff keys generated for tracking
+        List containing the single handoff key (or empty if no context)
     """
     context_tasks = _extract_context_tasks(task)
     if not context_tasks:
         return []
     
-    handoff_keys = []
     receiving_agent = _get_agent_role(task)
     receiving_task_id = _get_task_identifier(task)
     # Use task display name as fallback when agent role is unknown
     receiving_display = receiving_agent or _get_task_display_name(task)
+    
+    # Aggregate ALL context sources into a single handoff
+    handoff_key = str(uuid.uuid4())
+    
+    # Collect all context sources
+    context_sources = []
+    combined_context_parts = []
+    from_agents = []
     
     for ctx_task in context_tasks:
         # Get info about the providing task
@@ -184,67 +213,124 @@ def detect_task_context_handoff(
         # Use task display name as fallback when agent role is unknown
         providing_display = providing_agent or _get_task_display_name(ctx_task)
         
-        # Generate handoff key
-        handoff_key = str(uuid.uuid4())
-        handoff_keys.append(handoff_key)
-        
-        # Store pending handoff for correlation
-        run._handoff_pending[handoff_key] = {
-            "type": "implicit_context",
-            "from_role": providing_display,  # Use display name with fallback
-            "from_task_id": providing_task_id,
-            "to_role": receiving_display,  # Use display name with fallback
-            "to_task_id": receiving_task_id,
-            "proposed_at": run.now(),
-            "context_output": ctx_output,
-            "context_description": ctx_description,
+        source_info = {
+            "task_id": providing_task_id,
+            "agent_role": providing_display,
+            "description": ctx_description,
+            "output": ctx_output,
         }
+        context_sources.append(source_info)
+        from_agents.append(providing_display)
         
-        # Build payload for semantic analysis
-        payload = {
-            "context_source": {
-                "task_id": providing_task_id,
-                "agent_role": providing_display,
-                "description": ctx_description,
-            },
-            "context_output": ctx_output,
-        }
-        
-        # Compute hash for contract drift detection
-        content_hash = _compute_content_hash(ctx_output)
-        
-        # Emit handoff.proposed event
-        run.emit({
-            "schema_version": "trace_event.v0_1",
-            "run_id": run.run_id,
-            "tenant_id": run.tenant_id,
-            "project_id": run.project_id,
-            "trace_id": run.trace_id,
-            "span_id": span_id or new_span_id(),
-            "parent_span_id": run.current_parent_span_id(),
-            "seq": run.next_seq(),
-            "ts": run.now(),
-            "agent": {
-                "id": f"crewai:role:{providing_agent}" if providing_agent else None,
-                "role": providing_agent,
-            } if providing_agent else None,
-            "event_type": "handoff.proposed",
-            "status": "ok",
-            "summary": f"context handoff: {providing_display} -> {receiving_display}",
-            "attrs_compact": {
-                "handoff_key": handoff_key,
-                "handoff_type": "implicit_context",
-                "from_agent_role": providing_display,  # Use display name with fallback
-                "from_task_id": providing_task_id,
-                "to_agent_role": receiving_display,  # Use display name with fallback
-                "to_task_id": receiving_task_id,
-                "payload_hash": content_hash,
-            },
-            "payload": payload,
-            "raw_ref": {"storage": "inline"},
-        })
+        if ctx_output:
+            combined_context_parts.append(f"[{providing_display}]: {ctx_output}")
     
-    return handoff_keys
+    # Combine all context outputs for analysis
+    combined_context = "\n\n---\n\n".join(combined_context_parts) if combined_context_parts else None
+    
+    # Compute hash of combined context for drift detection
+    content_hash = _compute_content_hash(combined_context)
+    
+    # Store pending handoff with ALL context task references for re-reading at completion
+    run._handoff_pending[handoff_key] = {
+        "type": "implicit_context",
+        "context_tasks": context_tasks,  # Store task refs for re-reading at completion
+        "context_sources": context_sources,
+        "from_agents": from_agents,
+        "to_role": receiving_display,
+        "to_task_id": receiving_task_id,
+        "proposed_at": run.now(),
+        "combined_context": combined_context,
+    }
+    
+    # Build payload with all context sources for semantic analysis
+    payload = {
+        "context_sources": context_sources,
+        "combined_context": combined_context,
+        "context_source_count": len(context_sources),
+    }
+    
+    # Create summary showing all source agents
+    if len(from_agents) == 1:
+        summary = f"context handoff: {from_agents[0]} -> {receiving_display}"
+    else:
+        summary = f"context handoff: {len(from_agents)} sources -> {receiving_display}"
+    
+    # Emit SINGLE aggregated handoff.proposed event
+    run.emit({
+        "schema_version": "trace_event.v0_1",
+        "run_id": run.run_id,
+        "tenant_id": run.tenant_id,
+        "project_id": run.project_id,
+        "trace_id": run.trace_id,
+        "span_id": span_id or new_span_id(),
+        "parent_span_id": run.current_parent_span_id(),
+        "seq": run.next_seq(),
+        "ts": run.now(),
+        # Use first agent as the "from" agent for the event, but all are in payload
+        "agent": {
+            "id": f"crewai:role:{from_agents[0]}" if from_agents else None,
+            "role": from_agents[0] if from_agents else None,
+        } if from_agents else None,
+        "event_type": "handoff.proposed",
+        "status": "ok",
+        "summary": summary,
+        "attrs_compact": {
+            "handoff_key": handoff_key,
+            "handoff_type": "implicit_context",
+            "context_source_count": len(context_sources),
+            "from_agents": from_agents,
+            "to_agent_role": receiving_display,
+            "to_task_id": receiving_task_id,
+            "payload_hash": content_hash,
+        },
+        "payload": payload,
+        "raw_ref": {"storage": "inline"},
+    })
+    
+    return [handoff_key]
+
+
+def _extract_task_intent(task: Any) -> dict[str, Any]:
+    """
+    Extract task intent metadata for semantic drift analysis.
+    
+    This helps the backend understand what the task was supposed to do,
+    enabling smarter drift detection that distinguishes between:
+    - Data transformation tasks (should use/transform context)
+    - Review/coordination tasks (should validate, not repeat data)
+    - Pass-through tasks (should forward with minimal changes)
+    """
+    intent: dict[str, Any] = {}
+    
+    # Task description
+    desc = getattr(task, "description", None)
+    if desc:
+        intent["description"] = str(desc)[:500]
+    
+    # Expected output
+    expected = getattr(task, "expected_output", None)
+    if expected:
+        intent["expected_output"] = str(expected)[:300]
+    
+    # Agent goal (provides context on agent's purpose)
+    agent = getattr(task, "agent", None)
+    if agent:
+        goal = getattr(agent, "goal", None)
+        if goal:
+            intent["agent_goal"] = str(goal)[:300]
+        
+        # Agent role for additional context
+        role = getattr(agent, "role", None)
+        if role:
+            intent["agent_role"] = str(role)
+    
+    # Task name if available
+    name = getattr(task, "name", None)
+    if name:
+        intent["task_name"] = str(name)
+    
+    return intent
 
 
 def emit_implicit_handoff_complete(
@@ -258,6 +344,11 @@ def emit_implicit_handoff_complete(
     
     Called when a task completes. Looks up any pending implicit handoffs
     (both context-based and sequential) that targeted this task.
+    
+    For aggregated context handoffs (multiple sources), re-reads all context
+    from the original task references to ensure we capture the actual context
+    that was available (handles async timing where context may have been
+    incomplete at task start).
     
     Args:
         run: The active ArzuleRun
@@ -275,6 +366,9 @@ def emit_implicit_handoff_complete(
     # Use task display name as fallback when agent role is unknown
     agent_display = agent_role or _get_task_display_name(task)
     
+    # Extract task intent for smarter drift analysis
+    task_intent = _extract_task_intent(task)
+    
     # Find all pending handoffs targeting this task
     completed_count = 0
     keys_to_remove = []
@@ -289,20 +383,95 @@ def emit_implicit_handoff_complete(
         
         keys_to_remove.append(handoff_key)
         
-        # Get the original context that was provided (from_role already has fallback applied)
-        context_output = pending.get("context_output") or pending.get("previous_output")
-        from_agent = pending.get("from_role")
-        from_task = pending.get("from_task_id")
-        
-        # Build payload with both what was received and what was produced
-        payload = {
-            "received_context": {
-                "from_agent": from_agent,
-                "from_task": from_task,
-                "content": context_output[:500] if context_output else None,
-            },
-            "task_result": task_output[:500] if task_output else None,
-        }
+        # Build payload based on handoff type
+        if handoff_type == "implicit_context":
+            # Re-read all context sources from task refs (now complete)
+            # This ensures we capture actual context even for async tasks
+            context_tasks = pending.get("context_tasks", [])
+            actual_sources = []
+            combined_parts = []
+            from_agents = pending.get("from_agents", [])
+            
+            if context_tasks:
+                # New format: re-read from task references
+                for ctx_task in context_tasks:
+                    ctx_output = _get_task_output(ctx_task)  # Re-read at completion
+                    ctx_agent = _get_agent_role(ctx_task) or _get_task_display_name(ctx_task)
+                    ctx_description = _get_task_description(ctx_task)
+                    actual_sources.append({
+                        "agent_role": ctx_agent,
+                        "task_id": _get_task_identifier(ctx_task),
+                        "description": ctx_description,
+                        "output": ctx_output[:MAX_CONTEXT_OUTPUT_CHARS] if ctx_output else None,
+                    })
+                    if ctx_output:
+                        combined_parts.append(f"[{ctx_agent}]: {ctx_output}")
+            else:
+                # Backward compatibility: use stored context_sources or context_output
+                stored_sources = pending.get("context_sources", [])
+                if stored_sources:
+                    # New aggregated format stored at proposed time
+                    for source in stored_sources:
+                        actual_sources.append({
+                            "agent_role": source.get("agent_role"),
+                            "task_id": source.get("task_id"),
+                            "description": source.get("description"),
+                            "output": source.get("output"),
+                        })
+                        output = source.get("output")
+                        if output:
+                            combined_parts.append(f"[{source.get('agent_role', 'unknown')}]: {output}")
+                else:
+                    # Legacy single-source format
+                    legacy_output = pending.get("context_output")
+                    legacy_from = pending.get("from_role")
+                    legacy_task_id = pending.get("from_task_id")
+                    legacy_desc = pending.get("context_description")
+                    if legacy_output or legacy_from:
+                        actual_sources.append({
+                            "agent_role": legacy_from,
+                            "task_id": legacy_task_id,
+                            "description": legacy_desc,
+                            "output": legacy_output[:MAX_CONTEXT_OUTPUT_CHARS] if legacy_output else None,
+                        })
+                        if legacy_output:
+                            combined_parts.append(f"[{legacy_from or 'unknown'}]: {legacy_output}")
+                        # Also populate from_agents for attrs if not set
+                        if not from_agents and legacy_from:
+                            from_agents = [legacy_from]
+            
+            combined_actual = "\n\n---\n\n".join(combined_parts) if combined_parts else None
+            
+            payload = {
+                "received_context": {
+                    "source_count": len(actual_sources),
+                    "sources": actual_sources,
+                    "combined": combined_actual[:MAX_COMBINED_CONTEXT_CHARS] if combined_actual else None,
+                },
+                "task_result": task_output[:MAX_TASK_RESULT_CHARS] if task_output else None,
+                "task_intent": task_intent if task_intent else None,
+            }
+            
+            # For attrs, use the from_agents list
+            from_agent_display = ", ".join(from_agents[:3]) if from_agents else "unknown"
+            if len(from_agents) > 3:
+                from_agent_display += f" +{len(from_agents) - 3} more"
+        else:
+            # Sequential handoff - single source (legacy format)
+            context_output = pending.get("previous_output")
+            from_agent = pending.get("from_role")
+            from_task = pending.get("from_task_id")
+            
+            payload = {
+                "received_context": {
+                    "from_agent": from_agent,
+                    "from_task": from_task,
+                    "content": context_output[:MAX_CONTEXT_OUTPUT_CHARS] if context_output else None,
+                },
+                "task_result": task_output[:MAX_TASK_RESULT_CHARS] if task_output else None,
+                "task_intent": task_intent if task_intent else None,
+            }
+            from_agent_display = from_agent
         
         # Compute result hash
         result_hash = _compute_content_hash(task_output)
@@ -311,6 +480,21 @@ def emit_implicit_handoff_complete(
         result_summary = None
         if task_output:
             result_summary = task_output[:100] + "..." if len(task_output) > 100 else task_output
+        
+        # Build attrs_compact
+        attrs_compact = {
+            "handoff_key": handoff_key,
+            "handoff_type": handoff_type,
+            "to_agent_role": agent_display,
+            "result": result_summary,
+            "result_hash": result_hash,
+        }
+        
+        if handoff_type == "implicit_context":
+            attrs_compact["context_source_count"] = len(actual_sources)
+            attrs_compact["from_agents"] = from_agents
+        else:
+            attrs_compact["from_agent_role"] = from_agent_display
         
         # Emit handoff.complete
         run.emit({
@@ -330,14 +514,7 @@ def emit_implicit_handoff_complete(
             "event_type": "handoff.complete",
             "status": status,
             "summary": result_summary or f"context processed by {agent_display}",
-            "attrs_compact": {
-                "handoff_key": handoff_key,
-                "handoff_type": handoff_type,
-                "from_agent_role": from_agent,
-                "to_agent_role": agent_display,  # Use display name with fallback
-                "result": result_summary,
-                "result_hash": result_hash,
-            },
+            "attrs_compact": attrs_compact,
             "payload": payload,
             "raw_ref": {"storage": "inline"},
         })
@@ -455,7 +632,7 @@ def detect_sequential_handoff(
             "agent_role": previous_agent,
             "description": previous_description,
         },
-        "previous_output": previous_output[:1000] if previous_output else None,
+        "previous_output": previous_output[:MAX_CONTEXT_OUTPUT_CHARS] if previous_output else None,
         "current_task": {
             "task_id": current_task_id,
             "agent_role": current_agent,

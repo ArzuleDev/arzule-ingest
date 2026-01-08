@@ -266,11 +266,11 @@ def evt_llm_end(
                     payload["response"] = truncate_string(str(content), 2000)
                     payload["finish_reason"] = _safe_getattr(choice, "finish_reason", None)
         elif isinstance(response, str):
-            payload["response"] = truncate_string(response, 2000)
+            payload["response"] = sanitize(truncate_string(response, 2000))
         elif isinstance(response, dict):
             payload["response"] = sanitize(response)
         else:
-            payload["response"] = truncate_string(str(response), 2000)
+            payload["response"] = sanitize(truncate_string(str(response), 2000))
 
         # Extract usage info if available
         if hasattr(response, "usage"):
@@ -423,7 +423,7 @@ def evt_code_execution(
             "framework": "autogen",
         },
         "payload": {
-            "code": truncate_string(code, 2000),
+            "code": sanitize(truncate_string(code, 2000)),
             "output": sanitize(truncate_string(output, 2000)),
         },
     }
@@ -534,7 +534,7 @@ def evt_conversation_end(
 
 
 def _truncate_messages(messages: Any, max_messages: int = 10) -> list[dict[str, Any]]:
-    """Truncate message list for payload."""
+    """Truncate and sanitize message list for payload."""
     if not isinstance(messages, list):
         return []
 
@@ -543,18 +543,28 @@ def _truncate_messages(messages: Any, max_messages: int = 10) -> list[dict[str, 
         if isinstance(msg, dict):
             result.append({
                 "role": msg.get("role", "unknown"),
-                "content": truncate_string(str(msg.get("content", "")), 500),
+                # Apply sanitization to redact secrets and PII from message content
+                "content": sanitize(truncate_string(str(msg.get("content", "")), 500)),
             })
         else:
             # Try to extract from object
             result.append({
                 "role": _safe_getattr(msg, "role", "unknown"),
-                "content": truncate_string(str(_safe_getattr(msg, "content", msg)), 500),
+                "content": sanitize(truncate_string(str(_safe_getattr(msg, "content", msg)), 500)),
             })
 
     if len(messages) > max_messages:
         result.append({"_truncated": f"{len(messages) - max_messages} more messages"})
 
     return result
+
+
+
+
+
+
+
+
+
 
 
