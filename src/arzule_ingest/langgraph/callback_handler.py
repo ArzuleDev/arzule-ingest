@@ -113,6 +113,10 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
         # node_name -> [handoff_keys] - maps target nodes to pending handoffs
         self._handoff_targets: Dict[str, List[str]] = {}
         
+        # Track last completed node for determining handoff sources in conditional routing
+        # graph_run_id -> node_name
+        self._last_completed_node: Optional[str] = None
+        
         # Cached run_id for thread fallback
         self._cached_run_id: Optional[str] = None
         self._cached_run_id_lock = threading.Lock()
@@ -183,6 +187,34 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
         """Convert UUID to string key."""
         return str(run_id)
 
+    def _is_internal_routing_channel(self, chain_name: Optional[str]) -> bool:
+        """Check if a chain name is a LangGraph internal routing channel.
+        
+        LangGraph uses internal channels for async execution and routing:
+        - branch:to:* - Conditional edge routing to target nodes
+        - join:* - Barrier synchronization for parallel execution
+        - split:* - Fan-out channels for parallel execution
+        
+        These are infrastructure channels, not actual agent/node executions,
+        and should be filtered out from trace events.
+        
+        Args:
+            chain_name: The chain/node name to check
+            
+        Returns:
+            True if this is an internal routing channel that should be skipped
+        """
+        if not chain_name:
+            return False
+        
+        # Case-insensitive check for routing channel prefixes
+        name_lower = chain_name.lower()
+        return (
+            name_lower.startswith("branch:to:")
+            or name_lower.startswith("join:")
+            or name_lower.startswith("split:")
+        )
+
     def _start_span(self, run_id: UUID) -> str:
         """Create and track a new span for a run."""
         span_id = new_span_id()
@@ -234,6 +266,14 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
         if not run:
             return
 
+        # Extract the chain name first to check if it's an internal routing channel
+        chain_name = self._extract_chain_name_from_metadata(name, metadata, serialized)
+        
+        # Skip LangGraph's internal routing channels (branch:to:*, join:*, etc.)
+        # These are infrastructure for async execution and routing, not actual agent nodes
+        if self._is_internal_routing_channel(chain_name):
+            return
+
         # Determine if this is a LangGraph graph or node based on metadata
         # LangGraph passes serialized=None, but provides useful metadata
         chain_type = self._get_chain_type_from_metadata(name, metadata, tags, serialized)
@@ -241,9 +281,6 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
         # Skip if this is not a LangGraph-specific chain
         if chain_type == "other":
             return
-        
-        # Extract the chain name from metadata or name parameter
-        chain_name = self._extract_chain_name_from_metadata(name, metadata, serialized)
         
         span_id = self._start_span(run_id)
         parent_span = self._get_span(parent_run_id) if parent_run_id else None
@@ -291,7 +328,9 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
                 input_data=inputs,
                 metadata=metadata,
             )
-            run.emit(evt)
+            # evt is None if this is an internal routing channel
+            if evt:
+                run.emit(evt)
 
     def on_chain_end(
         self,
@@ -299,11 +338,21 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
         *,
         run_id: UUID,
         parent_run_id: Optional[UUID] = None,
+        name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
         """Called when a chain ends successfully."""
         run = self._get_run_with_fallback("on_chain_end")
         if not run:
+            return
+
+        # Skip LangGraph's internal routing channels (should already be filtered by on_chain_start)
+        # This is a safety check in case on_chain_end is called without on_chain_start
+        # Check both name and metadata["langgraph_node"] since the routing channel name
+        # may appear in either location depending on LangGraph version
+        chain_name = self._extract_chain_name_from_metadata(name, metadata, None)
+        if self._is_internal_routing_channel(chain_name):
             return
 
         span_id, start_span_id = self._end_span(run_id)
@@ -327,6 +376,10 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
             node_name = self._node_names.pop(run_key)
             node_metadata = self._node_metadata.pop(run_key, None)
             
+            # Track last completed node for conditional routing handoff detection
+            # This helps us determine the source when we see "branch:to:X" triggers
+            self._last_completed_node = node_name
+            
             # Check for handoff.complete if this node was a handoff target
             self._maybe_emit_handoff_complete(run, node_name, outputs, span_id, parent_span)
             
@@ -338,7 +391,9 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
                 output_data=outputs,
                 metadata=node_metadata,
             )
-            run.emit(evt)
+            # evt is None if this is an internal routing channel
+            if evt:
+                run.emit(evt)
             
             # Check if output contains Send objects for parallel fan-out detection
             self._maybe_emit_parallel_fanout(run, node_name, outputs, span_id, parent_span)
@@ -352,11 +407,20 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
         *,
         run_id: UUID,
         parent_run_id: Optional[UUID] = None,
+        name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
         """Called when a chain encounters an error."""
         run = self._get_run_with_fallback("on_chain_error")
         if not run:
+            return
+
+        # Skip LangGraph's internal routing channels (should already be filtered by on_chain_start)
+        # Check both name and metadata["langgraph_node"] since the routing channel name
+        # may appear in either location depending on LangGraph version
+        chain_name = self._extract_chain_name_from_metadata(name, metadata, None)
+        if self._is_internal_routing_channel(chain_name):
             return
 
         span_id, start_span_id = self._end_span(run_id)
@@ -392,7 +456,9 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
                 error=error,
                 metadata=node_metadata,
             )
-            run.emit(evt)
+            # evt is None if this is an internal routing channel
+            if evt:
+                run.emit(evt)
 
     # =========================================================================
     # LLM Callbacks (from nested LangChain calls)
@@ -1031,7 +1097,9 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
             payload=payload,
             handoff_type=handoff_type,
         )
-        run.emit(evt)
+        # evt is None if from_node or to_node are internal routing channels
+        if evt:
+            run.emit(evt)
 
     def _maybe_emit_implicit_handoff_proposed(
         self,
@@ -1074,16 +1142,34 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
         
         for trigger in triggers:
             trigger_str = str(trigger)
+            trigger_lower = trigger_str.lower()
             
             # Skip internal/entry triggers
-            if trigger_str.lower() in skip_triggers:
+            if trigger_lower in skip_triggers:
                 continue
+            
+            # Handle internal routing channels (branch:to:*, join:*, split:*)
+            # These indicate conditional routing - extract the actual source node
+            from_node = None
+            if trigger_lower.startswith("branch:to:"):
+                # This is conditional routing - use the last completed node as source
+                # The trigger "branch:to:X" means X was routed to, but doesn't tell us the source
+                # Use the most recently completed node as the source
+                from_node = self._last_completed_node
+                if not from_node:
+                    continue  # Can't determine source, skip
+            elif trigger_lower.startswith("join:") or trigger_lower.startswith("split:"):
+                # Join/split are synchronization points, not handoffs
+                continue
+            else:
+                # Direct trigger from a node (e.g., "intake" triggers "fact_gathering")
+                from_node = trigger_str
             
             # Skip if we already have a pending handoff for this exact transition
             # (source node may have explicitly set next_agent)
             already_pending = False
             for key, pending in self._handoff_pending.items():
-                if pending.get("from_node") == trigger_str and pending.get("to_node") == to_node:
+                if pending.get("from_node") == from_node and pending.get("to_node") == to_node:
                     already_pending = True
                     break
             
@@ -1091,12 +1177,12 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
                 continue
             
             # Build payload from inputs (the state being passed to this node)
-            payload = self._build_implicit_handoff_payload(inputs, trigger_str, to_node)
+            payload = self._build_implicit_handoff_payload(inputs, from_node, to_node)
             
             # Emit handoff.proposed for this implicit transition
             self._emit_handoff_proposed(
                 run=run,
-                from_node=trigger_str,
+                from_node=from_node,
                 to_node=to_node,
                 payload=payload,
                 handoff_type="langgraph_conditional",
@@ -1196,7 +1282,9 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
                 from_node=from_node,
                 to_node=node_name,
             )
-            run.emit(evt)
+            # evt is None if from_node or to_node are internal routing channels
+            if evt:
+                run.emit(evt)
 
     def _extract_meaningful_payload(self, outputs: Any) -> Any:
         """Extract meaningful content from LangGraph node outputs.
@@ -1393,5 +1481,7 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
                     status=status,
                     error=error,
                 )
-            run.emit(evt)
+            # evt is None if from_node or to_node are internal routing channels
+            if evt:
+                run.emit(evt)
 

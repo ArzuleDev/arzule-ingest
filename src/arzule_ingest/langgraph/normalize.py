@@ -285,12 +285,22 @@ def _extract_parallel_execution_info(metadata: Optional[Dict[str, Any]]) -> Dict
         info["step"] = metadata["langgraph_step"]
     
     # Triggers - what caused this node to execute (useful for tracking fan-out sources)
+    # Filter out internal routing channel triggers (branch:to:*, join:*, split:*)
     if "langgraph_triggers" in metadata:
         triggers = metadata["langgraph_triggers"]
         if isinstance(triggers, (list, tuple)):
-            info["triggers"] = list(triggers)
+            # Filter out internal routing channels from triggers
+            filtered_triggers = []
+            for t in triggers:
+                t_str = str(t).lower()
+                if not (t_str.startswith("branch:to:") or t_str.startswith("join:") or t_str.startswith("split:")):
+                    filtered_triggers.append(t)
+            if filtered_triggers:
+                info["triggers"] = filtered_triggers
         else:
-            info["triggers"] = [str(triggers)]
+            t_str = str(triggers).lower()
+            if not (t_str.startswith("branch:to:") or t_str.startswith("join:") or t_str.startswith("split:")):
+                info["triggers"] = [str(triggers)]
     
     # Execution path - shows position in graph topology
     if "langgraph_path" in metadata:
@@ -319,6 +329,18 @@ def _extract_parallel_execution_info(metadata: Optional[Dict[str, Any]]) -> Dict
     return info
 
 
+def _is_internal_routing_channel(node_name: str) -> bool:
+    """Check if this is a LangGraph internal routing channel that should be skipped."""
+    if not node_name:
+        return False
+    lower = node_name.lower()
+    return (
+        lower.startswith("branch:to:")
+        or lower.startswith("join:")
+        or lower.startswith("split:")
+    )
+
+
 def evt_node_start(
     run: "ArzuleRun",
     span_id: str,
@@ -326,8 +348,15 @@ def evt_node_start(
     node_name: str,
     input_data: Any,
     metadata: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Create event for node execution start."""
+) -> Optional[Dict[str, Any]]:
+    """Create event for node execution start.
+    
+    Returns None if this is an internal routing channel that should be skipped.
+    """
+    # Skip internal routing channels
+    if _is_internal_routing_channel(node_name):
+        return None
+    
     # Extract parallel execution info from LangGraph metadata
     parallel_info = _extract_parallel_execution_info(metadata)
     
@@ -374,8 +403,15 @@ def evt_node_end(
     output_data: Any,
     error: Optional[Exception] = None,
     metadata: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Create event for node execution end."""
+) -> Optional[Dict[str, Any]]:
+    """Create event for node execution end.
+    
+    Returns None if this is an internal routing channel that should be skipped.
+    """
+    # Skip internal routing channels
+    if _is_internal_routing_channel(node_name):
+        return None
+    
     status = "error" if error else "ok"
     summary = f"node completed: {node_name}"
     if error:
@@ -757,7 +793,7 @@ def evt_handoff_proposed(
     to_node: str,
     payload: Any,
     handoff_type: str = "langgraph_command",
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
     """Create event when a node routes to another node.
     
     In LangGraph, handoffs occur in three main patterns:
@@ -767,7 +803,13 @@ def evt_handoff_proposed(
     
     Pattern 3 is detected by examining langgraph_triggers metadata when a node starts,
     which reveals which node triggered this execution via conditional routing.
+    
+    Returns None if from_node or to_node are internal routing channels.
     """
+    # Skip if from_node or to_node are internal routing channels
+    if _is_internal_routing_channel(from_node) or _is_internal_routing_channel(to_node):
+        return None
+    
     return {
         **_base(run, span_id=span_id, parent_span_id=parent_span_id),
         "agent": {
@@ -797,11 +839,17 @@ def evt_handoff_ack(
     handoff_key: str,
     from_node: str,
     to_node: str,
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
     """Create event when the target node starts (acknowledges the handoff).
     
     In LangGraph, this fires when the destination node begins execution.
+    
+    Returns None if from_node or to_node are internal routing channels.
     """
+    # Skip if from_node or to_node are internal routing channels
+    if _is_internal_routing_channel(from_node) or _is_internal_routing_channel(to_node):
+        return None
+    
     return {
         **_base(run, span_id=span_id, parent_span_id=parent_span_id),
         "agent": {
@@ -831,11 +879,17 @@ def evt_handoff_complete(
     result: Any,
     status: str = "ok",
     error: Optional[Exception] = None,
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
     """Create event when the target node completes (handoff complete).
     
     In LangGraph, this fires when the destination node finishes execution.
+    
+    Returns None if from_node or to_node are internal routing channels.
     """
+    # Skip if from_node or to_node are internal routing channels
+    if _is_internal_routing_channel(from_node) or _is_internal_routing_channel(to_node):
+        return None
+    
     summary = f"handoff complete: {to_node}"
     if error:
         summary = f"handoff failed: {to_node} - {str(error)[:100]}"
