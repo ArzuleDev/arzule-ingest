@@ -382,10 +382,11 @@ def cmd_claude_status(args: argparse.Namespace) -> int:
         print(f"Settings Path: {status.get('settings_path', 'N/A')}")
 
         if status.get('installed'):
-            hooks = status.get('hooks_installed', [])
-            print(f"Hooks installed: {len(hooks)}")
-            for hook in hooks:
-                print(f"  - {hook}")
+            events = status.get('events', {})
+            installed_events = [k for k, v in events.items() if v]
+            print(f"Hooks installed: {len(installed_events)}")
+            for event in installed_events:
+                print(f"  - {event}")
         else:
             print("\nTo install, run: arzule claude install")
 
