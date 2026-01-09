@@ -16,7 +16,6 @@ from typing import Any, Optional
 
 # Lazy imports to avoid circular dependencies
 _ArzuleRun = None
-_ensure_run = None
 _HttpBatchSink = None
 _JsonlFileSink = None
 
@@ -30,12 +29,11 @@ STATE_DIR = Path.home() / ".arzule" / "claude_sessions"
 
 def _get_imports():
     """Lazy import to avoid circular dependencies."""
-    global _ArzuleRun, _ensure_run, _HttpBatchSink, _JsonlFileSink
+    global _ArzuleRun, _HttpBatchSink, _JsonlFileSink
     if _ArzuleRun is None:
-        from ..run import ArzuleRun, ensure_run
+        from ..run import ArzuleRun
         from ..sinks import HttpBatchSink, JsonlFileSink
         _ArzuleRun = ArzuleRun
-        _ensure_run = ensure_run
         _HttpBatchSink = HttpBatchSink
         _JsonlFileSink = JsonlFileSink
 
@@ -65,9 +63,14 @@ def get_or_create_session(session_id: str) -> Any:
         project_id = os.environ.get("ARZULE_PROJECT_ID")
 
         if api_key and tenant_id and project_id:
+            # Production endpoint (hardcoded, can override via env var for testing)
+            endpoint = os.environ.get(
+                "ARZULE_ENDPOINT",
+                "https://dh43xnx5e03pq.cloudfront.net/ingest"
+            )
             sink = _HttpBatchSink(
+                endpoint_url=endpoint,
                 api_key=api_key,
-                ingest_url=os.environ.get("ARZULE_INGEST_URL", "https://api.arzule.com/ingest")
             )
         else:
             # Fallback to local file
@@ -75,13 +78,16 @@ def get_or_create_session(session_id: str) -> Any:
             traces_dir.mkdir(parents=True, exist_ok=True)
             sink = _JsonlFileSink(str(traces_dir / f"claude_{session_id}.jsonl"))
 
-        run = _ensure_run(
-            run_id=state.get("run_id") or _session_to_run_id(session_id),
+        # Create ArzuleRun directly for Claude Code sessions
+        run_id = state.get("run_id") or _session_to_run_id(session_id)
+        run = _ArzuleRun(
+            run_id=run_id,
             tenant_id=tenant_id or "local",
             project_id=project_id or "claude_code",
             sink=sink,
-            source_framework="claude_code",
         )
+        # Enter the run context to initialize it
+        run.__enter__()
 
         _sessions[session_id] = run
         _session_state[session_id] = state
@@ -100,7 +106,8 @@ def close_session(session_id: str) -> None:
         if session_id in _sessions:
             run = _sessions.pop(session_id)
             try:
-                run.flush()
+                # Flush the sink to send any buffered events
+                run.sink.flush()
             except Exception:
                 pass
 

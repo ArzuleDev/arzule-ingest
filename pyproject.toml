@@ -43,6 +43,8 @@ dev = [
 
 [project.scripts]
 arzule = "arzule_ingest.cli:main"
+arzule-claude = "arzule_ingest.claude.wrapper:main"
+arzule-claude-install = "arzule_ingest.claude.install:main"
 
 [project.urls]
 Homepage = "https://arzule.com"

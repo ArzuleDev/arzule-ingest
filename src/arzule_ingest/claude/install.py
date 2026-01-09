@@ -12,91 +12,57 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
-# Hook configuration for each event type
-HOOK_CONFIG = {
-    "SessionStart": [
-        {
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": f"{sys.executable} -m arzule_ingest.claude.hook"
-                }
-            ]
-        }
-    ],
-    "SessionEnd": [
-        {
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": f"{sys.executable} -m arzule_ingest.claude.hook"
-                }
-            ]
-        }
-    ],
-    "PreToolUse": [
-        {
-            "matcher": ".*",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": f"{sys.executable} -m arzule_ingest.claude.hook"
-                }
-            ]
-        }
-    ],
-    "PostToolUse": [
-        {
-            "matcher": ".*",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": f"{sys.executable} -m arzule_ingest.claude.hook"
-                }
-            ]
-        }
-    ],
-    "SubagentStop": [
-        {
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": f"{sys.executable} -m arzule_ingest.claude.hook"
-                }
-            ]
-        }
-    ],
-    "Stop": [
-        {
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": f"{sys.executable} -m arzule_ingest.claude.hook"
-                }
-            ]
-        }
-    ],
-    "PreCompact": [
-        {
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": f"{sys.executable} -m arzule_ingest.claude.hook"
-                }
-            ]
-        }
-    ],
-    "Notification": [
-        {
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": f"{sys.executable} -m arzule_ingest.claude.hook"
-                }
-            ]
-        }
-    ],
-}
+
+def _get_hook_command() -> str:
+    """
+    Generate the hook command for Claude Code.
+
+    Uses the Python executable that's running this script, which ensures
+    the hook runs in the same environment where arzule-ingest is installed.
+    """
+    python_exe = sys.executable
+    return f'{python_exe} -m arzule_ingest.claude.hook'
+
+
+def _build_hook_config() -> dict:
+    """Build hook configuration with dynamic command."""
+    command = _get_hook_command()
+
+    return {
+        "SessionStart": [
+            {"hooks": [{"type": "command", "command": command}]}
+        ],
+        "SessionEnd": [
+            {"hooks": [{"type": "command", "command": command}]}
+        ],
+        "UserPromptSubmit": [
+            # CRITICAL: This starts a new turn - enables per-turn tracking
+            {"hooks": [{"type": "command", "command": command}]}
+        ],
+        "PreToolUse": [
+            {"matcher": ".*", "hooks": [{"type": "command", "command": command}]}
+        ],
+        "PostToolUse": [
+            {"matcher": ".*", "hooks": [{"type": "command", "command": command}]}
+        ],
+        "SubagentStop": [
+            {"hooks": [{"type": "command", "command": command}]}
+        ],
+        "Stop": [
+            # CRITICAL: This ends the current turn
+            {"hooks": [{"type": "command", "command": command}]}
+        ],
+        "PreCompact": [
+            {"hooks": [{"type": "command", "command": command}]}
+        ],
+        "Notification": [
+            {"hooks": [{"type": "command", "command": command}]}
+        ],
+    }
+
+
+# Hook configuration (built dynamically)
+HOOK_CONFIG = _build_hook_config()
 
 # Identifier to recognize Arzule hooks
 ARZULE_HOOK_MARKER = "arzule_ingest.claude.hook"
@@ -373,21 +339,30 @@ def generate_settings_json() -> str:
 def print_installation_instructions() -> None:
     """Print manual installation instructions."""
     print("=" * 60)
-    print("Arzule Claude Code Instrumentation - Manual Installation")
+    print("Arzule Claude Code Instrumentation")
     print("=" * 60)
+    print()
+    print("RECOMMENDED: Use the wrapper command for full observability:")
+    print()
+    print("  $ arzule-claude \"your prompt\"")
+    print()
+    print("This captures BOTH hooks data AND OTel metrics (tokens, costs).")
+    print()
+    print("-" * 60)
+    print("Alternative: Hooks-only installation")
+    print("-" * 60)
     print()
     print("Add the following to your ~/.claude/settings.json file:")
     print()
     print(generate_settings_json())
     print()
     print("=" * 60)
-    print("Environment Variables Required:")
+    print("Configuration (run 'arzule configure' to set up):")
     print("  ARZULE_API_KEY - Your Arzule API key")
     print("  ARZULE_TENANT_ID - Your tenant ID")
     print("  ARZULE_PROJECT_ID - Your project ID")
     print()
-    print("Without these variables, traces will be saved locally to:")
-    print("  ~/.arzule/traces/claude_{session_id}.jsonl")
+    print("Config file: ~/.arzule/config")
     print("=" * 60)
 
 
@@ -419,31 +394,41 @@ def main():
 
     if args.command == "install":
         if install_claude_code(args.path, force=args.force):
-            print("✓ Arzule hooks installed successfully")
+            print("Arzule hooks installed successfully")
             status = get_installation_status(args.path)
             print(f"  Settings: {status['settings_path']}")
+            print()
+            print("For full observability (hooks + OTel metrics), use:")
+            print("  $ arzule-claude \"your prompt\"")
+            print()
+            print("Or run 'claude' directly (hooks only, no token metrics)")
         else:
-            print("✗ Failed to install hooks", file=sys.stderr)
+            print("Failed to install hooks", file=sys.stderr)
             sys.exit(1)
 
     elif args.command == "uninstall":
         if uninstall_claude_code(args.path):
-            print("✓ Arzule hooks uninstalled")
+            print("Arzule hooks uninstalled")
         else:
-            print("✗ Failed to uninstall hooks", file=sys.stderr)
+            print("Failed to uninstall hooks", file=sys.stderr)
             sys.exit(1)
 
     elif args.command == "status":
         status = get_installation_status(args.path)
         if status["installed"]:
-            print("✓ Arzule hooks are installed")
+            print("Arzule hooks are installed")
             print(f"  Settings: {status['settings_path']}")
             print("  Events:")
             for event, installed in status["events"].items():
-                icon = "✓" if installed else "✗"
+                icon = "[x]" if installed else "[ ]"
                 print(f"    {icon} {event}")
+            print()
+            print("Tip: Use 'arzule-claude' for full observability (hooks + OTel)")
         else:
-            print("✗ Arzule hooks are not installed")
+            print("Arzule hooks are not installed")
+            print()
+            print("Run 'arzule-claude-install install' to install hooks")
+            print("Or use 'arzule-claude' directly (auto-configures OTel)")
 
     elif args.command == "show":
         print_installation_instructions()
