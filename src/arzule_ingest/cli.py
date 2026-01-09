@@ -304,13 +304,17 @@ def cmd_claude_install(args: argparse.Namespace) -> int:
         print(f"Error: Claude Code module not available: {e}", file=sys.stderr)
         return 1
 
-    mode = "project" if args.project else "user"
-    project_path = args.project if args.project else None
+    from pathlib import Path
+
+    # Determine settings path based on --project flag
+    settings_path = None
+    if args.project:
+        settings_path = Path(args.project) / ".claude" / "settings.json"
 
     try:
-        success = install_claude_code(mode=mode, project_path=project_path)
+        success = install_claude_code(settings_path=settings_path)
         if success:
-            status = get_installation_status(project_path)
+            status = get_installation_status(settings_path)
             print(f"Successfully installed Arzule hooks to: {status.get('settings_path', 'settings.json')}")
             print("\nTo complete setup, set these environment variables:")
             print("  export ARZULE_API_KEY='your-api-key'")
@@ -334,11 +338,15 @@ def cmd_claude_uninstall(args: argparse.Namespace) -> int:
         print(f"Error: Claude Code module not available: {e}", file=sys.stderr)
         return 1
 
-    mode = "project" if args.project else "user"
-    project_path = args.project if args.project else None
+    from pathlib import Path
+
+    # Determine settings path based on --project flag
+    settings_path = None
+    if args.project:
+        settings_path = Path(args.project) / ".claude" / "settings.json"
 
     try:
-        success = uninstall_claude_code(mode=mode, project_path=project_path)
+        success = uninstall_claude_code(settings_path=settings_path)
         if success:
             print("Successfully removed Arzule hooks from Claude Code settings.")
             return 0
@@ -358,10 +366,15 @@ def cmd_claude_status(args: argparse.Namespace) -> int:
         print(f"Error: Claude Code module not available: {e}", file=sys.stderr)
         return 1
 
-    project_path = args.project if args.project else None
+    from pathlib import Path
+
+    # Determine settings path based on --project flag
+    settings_path = None
+    if args.project:
+        settings_path = Path(args.project) / ".claude" / "settings.json"
 
     try:
-        status = get_installation_status(project_path)
+        status = get_installation_status(settings_path)
 
         print("Claude Code Integration Status")
         print("=" * 40)
