@@ -296,14 +296,146 @@ def cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_claude_install(args: argparse.Namespace) -> int:
+    """Install Arzule hooks into Claude Code settings."""
+    try:
+        from .claude.install import install_claude_code, get_installation_status
+    except ImportError as e:
+        print(f"Error: Claude Code module not available: {e}", file=sys.stderr)
+        return 1
+
+    mode = "project" if args.project else "user"
+    project_path = args.project if args.project else None
+
+    try:
+        success = install_claude_code(mode=mode, project_path=project_path)
+        if success:
+            status = get_installation_status(project_path)
+            print(f"Successfully installed Arzule hooks to: {status.get('settings_path', 'settings.json')}")
+            print("\nTo complete setup, set these environment variables:")
+            print("  export ARZULE_API_KEY='your-api-key'")
+            print("  export ARZULE_TENANT_ID='your-tenant-id'")
+            print("  export ARZULE_PROJECT_ID='your-project-id'")
+            print("\nOr for local-only tracing, traces will be saved to ~/.arzule/traces/")
+            return 0
+        else:
+            print("Installation failed.", file=sys.stderr)
+            return 1
+    except Exception as e:
+        print(f"Error during installation: {e}", file=sys.stderr)
+        return 1
+
+
+def cmd_claude_uninstall(args: argparse.Namespace) -> int:
+    """Remove Arzule hooks from Claude Code settings."""
+    try:
+        from .claude.install import uninstall_claude_code
+    except ImportError as e:
+        print(f"Error: Claude Code module not available: {e}", file=sys.stderr)
+        return 1
+
+    mode = "project" if args.project else "user"
+    project_path = args.project if args.project else None
+
+    try:
+        success = uninstall_claude_code(mode=mode, project_path=project_path)
+        if success:
+            print("Successfully removed Arzule hooks from Claude Code settings.")
+            return 0
+        else:
+            print("Uninstallation failed.", file=sys.stderr)
+            return 1
+    except Exception as e:
+        print(f"Error during uninstallation: {e}", file=sys.stderr)
+        return 1
+
+
+def cmd_claude_status(args: argparse.Namespace) -> int:
+    """Check Arzule hook installation status for Claude Code."""
+    try:
+        from .claude.install import get_installation_status, print_installation_instructions
+    except ImportError as e:
+        print(f"Error: Claude Code module not available: {e}", file=sys.stderr)
+        return 1
+
+    project_path = args.project if args.project else None
+
+    try:
+        status = get_installation_status(project_path)
+
+        print("Claude Code Integration Status")
+        print("=" * 40)
+        print(f"Installed: {'Yes' if status.get('installed') else 'No'}")
+        print(f"Settings Path: {status.get('settings_path', 'N/A')}")
+
+        if status.get('installed'):
+            hooks = status.get('hooks_installed', [])
+            print(f"Hooks installed: {len(hooks)}")
+            for hook in hooks:
+                print(f"  - {hook}")
+        else:
+            print("\nTo install, run: arzule claude install")
+
+        # Environment check
+        import os
+        api_key = os.environ.get("ARZULE_API_KEY")
+        tenant_id = os.environ.get("ARZULE_TENANT_ID")
+        project_id = os.environ.get("ARZULE_PROJECT_ID")
+
+        print("\nEnvironment:")
+        print(f"  ARZULE_API_KEY: {'Set' if api_key else 'Not set'}")
+        print(f"  ARZULE_TENANT_ID: {'Set' if tenant_id else 'Not set'}")
+        print(f"  ARZULE_PROJECT_ID: {'Set' if project_id else 'Not set'}")
+
+        if not all([api_key, tenant_id, project_id]):
+            print("\n  Note: Without all env vars, traces save locally to ~/.arzule/traces/")
+
+        return 0
+    except Exception as e:
+        print(f"Error checking status: {e}", file=sys.stderr)
+        return 1
+
+
 def main() -> int:
     """Main CLI entrypoint."""
     parser = argparse.ArgumentParser(
         prog="arzule",
-        description="Arzule trace viewer - inspect JSONL trace files locally",
+        description="Arzule observability SDK - trace multi-agent AI systems",
     )
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
+    # === Claude Code commands ===
+    claude_parser = subparsers.add_parser("claude", help="Claude Code integration")
+    claude_subparsers = claude_parser.add_subparsers(dest="claude_command", help="Claude commands")
+
+    # claude install
+    claude_install = claude_subparsers.add_parser("install", help="Install Arzule hooks")
+    claude_install.add_argument(
+        "--project", "-p",
+        metavar="PATH",
+        help="Install to project-level settings (.claude/settings.json)",
+    )
+    claude_install.set_defaults(func=cmd_claude_install)
+
+    # claude uninstall
+    claude_uninstall = claude_subparsers.add_parser("uninstall", help="Remove Arzule hooks")
+    claude_uninstall.add_argument(
+        "--project", "-p",
+        metavar="PATH",
+        help="Remove from project-level settings",
+    )
+    claude_uninstall.set_defaults(func=cmd_claude_uninstall)
+
+    # claude status
+    claude_status = claude_subparsers.add_parser("status", help="Check installation status")
+    claude_status.add_argument(
+        "--project", "-p",
+        metavar="PATH",
+        help="Check project-level settings",
+    )
+    claude_status.set_defaults(func=cmd_claude_status)
+
+    # === View commands ===
     # view command
     view_parser = subparsers.add_parser("view", help="View a trace file")
     view_parser.add_argument("file", help="Path to the JSONL trace file")
@@ -335,6 +467,13 @@ def main() -> int:
     if not args.command:
         parser.print_help()
         return 0
+
+    # Handle claude subcommand
+    if args.command == "claude":
+        if not getattr(args, 'claude_command', None):
+            claude_parser.print_help()
+            return 0
+        return args.func(args)
 
     return args.func(args)
 
