@@ -52,3 +52,4 @@ class MultiSink(TelemetrySink):
             except Exception:
                 pass
 
+
