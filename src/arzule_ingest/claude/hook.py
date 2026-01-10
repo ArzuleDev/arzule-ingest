@@ -187,15 +187,20 @@ def handle_session_start(input_data: dict) -> None:
 
 
 def handle_session_end(input_data: dict) -> None:
-    """Handle SessionEnd hook - emit session.end and cleanup."""
+    """Handle SessionEnd hook - emit session.end and cleanup.
+
+    This handler ensures both turn-level and session-level runs are properly
+    closed with run.end events, which transitions their status from 'receiving'
+    to 'indexed' on the backend.
+    """
     session_id = input_data["session_id"]
     transcript_path = input_data.get("transcript_path")
 
-    # End any active turn first
+    # End any active turn first - this emits run.end for the turn-level run
     active_turn = get_current_turn(session_id)
     if active_turn:
         end_turn(session_id, summary="Session ended")
-    
+
     # Get session-level run
     run = get_or_create_run(session_id)
 
@@ -222,7 +227,14 @@ def handle_session_end(input_data: dict) -> None:
         },
     ))
 
-    _flush_run(run, session_id)
+    # Properly close the session-level run by calling __exit__
+    # This emits run.end which transitions the run status from 'receiving' to 'indexed'
+    # on the backend, so the session shows as "Ended" instead of "Active"
+    try:
+        run.__exit__(None, None, None)
+    except Exception:
+        # Fallback: at least flush the sink
+        _flush_run(run, session_id)
 
 
 def handle_user_prompt(input_data: dict) -> None:
@@ -254,6 +266,33 @@ def handle_user_prompt(input_data: dict) -> None:
         # The subagent's tool calls will use the parent's turn which has the Task span.
         _log_error(f"UserPromptSubmit: SUBAGENT detected ({len(active_handoffs)} active handoffs), reusing parent turn")
         _log_error(f"UserPromptSubmit: active handoffs: {[h.get('subagent_type') for h in active_handoffs]}")
+
+        # CRITICAL FIX: Track which subagent is currently executing
+        # For parallel Tasks, we need to identify the correct one
+        # Match by finding the handoff whose prompt matches (stored in active_subagents)
+        turn_info = existing_turn
+        active_subagents = turn_info.get("active_subagents", {})
+        matched_tool_use_id = None
+
+        # Try to match by prompt content
+        for tool_use_id, info in active_subagents.items():
+            stored_prompt = info.get("prompt", "")
+            # Check if prompts match (subagent prompts typically include the Task prompt)
+            if stored_prompt and prompt and (stored_prompt in prompt or prompt in stored_prompt):
+                matched_tool_use_id = tool_use_id
+                _log_error(f"UserPromptSubmit: MATCHED subagent by prompt, tool_use_id={tool_use_id}")
+                break
+
+        # Fallback: if only one active handoff, use that
+        if not matched_tool_use_id and len(active_handoffs) == 1:
+            matched_tool_use_id = active_handoffs[0].get("tool_use_id")
+            _log_error(f"UserPromptSubmit: Using single active handoff, tool_use_id={matched_tool_use_id}")
+
+        # Store the currently executing subagent for tool call attribution
+        if matched_tool_use_id:
+            update_turn_state(session_id, {"current_executing_subagent": matched_tool_use_id})
+            _log_error(f"UserPromptSubmit: Set current_executing_subagent={matched_tool_use_id}")
+
         # Just flush and return - don't create a new turn
         run = existing_turn["run"]
         _flush_run(run, session_id)
@@ -509,24 +548,39 @@ def _handle_regular_tool_start(
     # can walk the parent_span_id chain to find the handoff context
     spans = turn_info.get("spans", [])
     parent_span_id = None
-
-    # Find the SPECIFIC subagent span this tool belongs to
-    # For parallel subagents, we need to find the right one, not just any subagent span
-    # The tool call should be parented to the MOST RECENT subagent span (innermost context)
     handoff_key = None
     subagent_type = None
-    for span in reversed(spans):
-        if span.get("subagent_type"):
-            parent_span_id = span.get("span_id")
-            subagent_type = span.get("subagent_type")
-            # Get the handoff_key for this subagent instance
-            span_tool_use_id = span.get("tool_use_id")
-            if span_tool_use_id:
-                # Generate handoff_key directly - it's the deterministic hash
-                # of session_id + tool_use_id (not stored in handoff dict)
-                handoff_key = generate_handoff_key(session_id, span_tool_use_id)
-            _log_error(f"PreToolUse[{tool_name}]: setting parent_span_id={parent_span_id}, handoff_key={handoff_key} from subagent span (type={subagent_type}, tool_use_id={span_tool_use_id})")
-            break
+
+    # CRITICAL FIX: For parallel subagents, use current_executing_subagent to find the correct span
+    # This is set in UserPromptSubmit when a subagent starts executing
+    current_executing = turn_info.get("current_executing_subagent")
+
+    if current_executing:
+        # Look up the span in turn_info["spans"] where turn.push_span stores them
+        # NOTE: We can't use spanctx.get_span_by_tool_use because that looks in a different
+        # storage location (session_state["spans_by_tool_use"]) which turn.push_span doesn't populate.
+        for span in turn_info.get("spans", []):
+            if span.get("tool_use_id") == current_executing and span.get("subagent_type"):
+                parent_span_id = span.get("span_id")
+                subagent_type = span.get("subagent_type")
+                handoff_key = generate_handoff_key(session_id, current_executing)
+                _log_error(f"PreToolUse[{tool_name}]: using current_executing_subagent={current_executing}, parent_span_id={parent_span_id}, handoff_key={handoff_key}")
+                break
+
+    # Fallback: iterate spans (for nested contexts or single subagent)
+    if not parent_span_id:
+        for span in reversed(spans):
+            if span.get("subagent_type"):
+                parent_span_id = span.get("span_id")
+                subagent_type = span.get("subagent_type")
+                # Get the handoff_key for this subagent instance
+                span_tool_use_id = span.get("tool_use_id")
+                if span_tool_use_id:
+                    # Generate handoff_key directly - it's the deterministic hash
+                    # of session_id + tool_use_id (not stored in handoff dict)
+                    handoff_key = generate_handoff_key(session_id, span_tool_use_id)
+                _log_error(f"PreToolUse[{tool_name}]: FALLBACK setting parent_span_id={parent_span_id}, handoff_key={handoff_key} from subagent span (type={subagent_type}, tool_use_id={span_tool_use_id})")
+                break
 
     # Debug: log agent context for tool calls (helps verify subagent attribution)
     _log_error(f"PreToolUse[{tool_name}]: agent_id={agent_id}, agent_role={agent_role}, spans_count={len(spans)}, parent_span_id={parent_span_id}, handoff_key={handoff_key}")
@@ -644,8 +698,18 @@ def _handle_task_complete(
     active_subagents = turn_info.get("active_subagents", {})
     subagent_info = active_subagents.pop(tool_use_id, None)
     subagent_type = subagent_info.get("type", "unknown") if subagent_info else "unknown"
-    # Persist the updated active_subagents to disk for subsequent hooks
-    update_turn_state(session_id, {"active_subagents": active_subagents})
+
+    # Clear current_executing_subagent if it matches this tool_use_id
+    current_executing = turn_info.get("current_executing_subagent")
+    if current_executing == tool_use_id:
+        _log_error(f"TaskComplete: clearing current_executing_subagent={tool_use_id}")
+        update_turn_state(session_id, {
+            "active_subagents": active_subagents,
+            "current_executing_subagent": None
+        })
+    else:
+        # Persist the updated active_subagents to disk for subsequent hooks
+        update_turn_state(session_id, {"active_subagents": active_subagents})
 
     # Pop span (pop_span already persists to disk)
     span_info = pop_span(session_id, tool_use_id)
@@ -1220,33 +1284,51 @@ def _extract_tool_result_from_transcript(
 
 def _get_current_agent_id(session_id: str, turn_info: Optional[dict] = None) -> str:
     """Get the current agent ID based on span context.
-    
+
     If we're inside a subagent delegation (Task span), return the subagent's ID.
-    We check ALL spans in the stack, not just the top one, because tool calls
-    inside a subagent context should be attributed to that subagent.
+    For parallel subagents, we use current_executing_subagent to identify the correct one.
     """
     if turn_info:
-        # Check all spans for subagent context (not just topmost)
-        # Tool calls inside a Task delegation belong to that subagent
         spans = turn_info.get("spans", [])
-        for span in reversed(spans):  # Check from most recent
+
+        # PRIORITY 1: Use current_executing_subagent for parallel subagent scenarios
+        # This is set in UserPromptSubmit when a subagent starts executing
+        current_executing = turn_info.get("current_executing_subagent")
+        if current_executing:
+            for span in spans:
+                if span.get("tool_use_id") == current_executing and span.get("subagent_type"):
+                    return f"claude_code:subagent:{span['subagent_type']}:{span['tool_use_id']}"
+
+        # PRIORITY 2: Fall back to most recent subagent span (for single subagent case)
+        for span in reversed(spans):
             if span.get("subagent_type"):
                 return f"claude_code:subagent:{span['subagent_type']}:{span['tool_use_id']}"
+
     return f"claude_code:main:{session_id}"
 
 
 def _get_current_agent_role(turn_info: Optional[dict] = None) -> str:
     """Get the current agent role based on span context.
-    
+
     If we're inside a subagent delegation, return that subagent's role.
+    For parallel subagents, we use current_executing_subagent to identify the correct one.
     """
     if turn_info:
-        # Check all spans for subagent context (not just topmost)
         spans = turn_info.get("spans", [])
+
+        # PRIORITY 1: Use current_executing_subagent for parallel subagent scenarios
+        current_executing = turn_info.get("current_executing_subagent")
+        if current_executing:
+            for span in spans:
+                if span.get("tool_use_id") == current_executing and span.get("subagent_type"):
+                    return span["subagent_type"]
+
+        # PRIORITY 2: Fall back to most recent subagent span (for single subagent case)
         for span in reversed(spans):
             subagent_type = span.get("subagent_type")
             if subagent_type:
                 return subagent_type
+
     return "main"
 
 
