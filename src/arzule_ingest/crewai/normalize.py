@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from typing import TYPE_CHECKING, Any, Optional
 
 from ..ids import new_span_id
@@ -12,6 +13,15 @@ from .handoff import is_delegation_tool
 
 if TYPE_CHECKING:
     from ..run import ArzuleRun
+
+
+def _generate_instance_id() -> str:
+    """Generate a unique instance identifier for agent tracking.
+
+    Returns:
+        A short unique identifier (8 characters) for agent instance.
+    """
+    return uuid.uuid4().hex[:8]
 
 
 def _safe_getattr(obj: Any, attr: str, default: Any = None) -> Any:
@@ -62,9 +72,13 @@ def _extract_input_keys(tool_input: Any, max_keys: int = 10) -> list[str]:
         return []
 
 
-def _extract_agent_info(agent: Any) -> Optional[dict[str, Any]]:
+def _extract_agent_info(
+    agent: Any,
+    parent_agent_id: Optional[str] = None,
+    instance_id: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
     """Extract agent info from CrewAI agent object.
-    
+
     Extracts key agent attributes that are useful for trace analysis:
     - role: Agent's function/expertise within the crew
     - goal: Individual objective guiding decision-making
@@ -73,16 +87,35 @@ def _extract_agent_info(agent: Any) -> Optional[dict[str, Any]]:
     - max_iter: Maximum iterations before agent must provide answer
     - max_execution_time: Timeout in seconds
     - verbose: Whether detailed logging is enabled
+
+    Args:
+        agent: The CrewAI agent object to extract info from.
+        parent_agent_id: Optional ID of the parent agent that spawned this one.
+        instance_id: Optional pre-generated instance ID. If not provided, a new one
+            will be generated to ensure each agent instance has a unique identifier.
+
+    Returns:
+        Dict with agent info including instance-aware ID, or None if no agent.
     """
     if not agent:
         return None
 
     role = _safe_getattr(agent, "role", None) or _safe_getattr(agent, "name", "unknown")
-    
+
+    # Generate instance-aware ID: crewai:role:{role}:instance_{unique_id}
+    # This ensures each agent instance gets a unique identifier even if
+    # multiple instances of the same agent type (role) are created.
+    agent_instance_id = instance_id or _generate_instance_id()
+
     info: dict[str, Any] = {
-        "id": f"crewai:role:{role}",
+        "id": f"crewai:role:{role}:instance_{agent_instance_id}",
         "role": role,
+        "instance_id": agent_instance_id,
     }
+
+    # Track parent agent for spawn/delegation relationships
+    if parent_agent_id:
+        info["parent_agent_id"] = parent_agent_id
     
     # Goal - provides context for agent behavior
     goal = _safe_getattr(agent, "goal", None)
@@ -126,20 +159,26 @@ def _extract_agent_info(agent: Any) -> Optional[dict[str, Any]]:
     return info
 
 
-def extract_agent_info_from_event(event: Any) -> Optional[dict[str, Any]]:
+def extract_agent_info_from_event(
+    event: Any,
+    parent_agent_id: Optional[str] = None,
+    instance_id: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
     """Extract agent info dict from a CrewAI event object.
-    
+
     This is a convenience function for the listener to extract agent info
     from event bus events for thread-local agent tracking.
-    
+
     Args:
         event: CrewAI event object (e.g., AgentExecutionStartedEvent)
-        
+        parent_agent_id: Optional ID of the parent agent that spawned this one.
+        instance_id: Optional pre-generated instance ID for consistent tracking.
+
     Returns:
-        Agent info dict with 'id' and 'role', or None if no agent
+        Agent info dict with 'id', 'role', and 'instance_id', or None if no agent
     """
     agent = _safe_getattr(event, "agent", None)
-    return _extract_agent_info(agent)
+    return _extract_agent_info(agent, parent_agent_id=parent_agent_id, instance_id=instance_id)
 
 
 def _extract_task_info(task: Any) -> tuple[Optional[str], Optional[str]]:
@@ -442,6 +481,8 @@ def evt_from_crewai_event(
     parent_span_id: Optional[str] = None,
     task_key: Optional[str] = None,
     llm_token_usage: Optional[dict[str, int]] = None,
+    parent_agent_id: Optional[str] = None,
+    agent_instance_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Convert a CrewAI event bus event to a TraceEvent.
@@ -452,6 +493,8 @@ def evt_from_crewai_event(
         parent_span_id: Optional explicit parent span (for concurrent task tracking)
         task_key: Optional task key for correlation in concurrent mode
         llm_token_usage: Optional token usage dict for LLM call events
+        parent_agent_id: Optional ID of the parent agent that spawned this event's agent
+        agent_instance_id: Optional pre-generated instance ID for consistent agent tracking
 
     Returns:
         TraceEvent dict
@@ -532,18 +575,29 @@ def evt_from_crewai_event(
     task = _safe_getattr(event, "task", None)
     crew = _safe_getattr(event, "crew", None)
 
-    agent_info = _extract_agent_info(agent)
-    
+    # Use passed instance_id for consistent tracking across start/end events
+    # Generate a new one only if not provided (for start events)
+    agent_info = _extract_agent_info(
+        agent,
+        parent_agent_id=parent_agent_id,
+        instance_id=agent_instance_id,
+    )
+
     # Fallback: check for agent_role/agent_id directly on event (e.g., LLM events)
     # CrewAI's LLM events set agent_role/agent_id directly from from_agent, not as nested object
     if not agent_info:
         agent_role = _safe_getattr(event, "agent_role", None)
         if agent_role:
             agent_id = _safe_getattr(event, "agent_id", None)
+            # Generate instance-aware ID for fallback agent info
+            fallback_instance_id = agent_instance_id or _generate_instance_id()
             agent_info = {
-                "id": agent_id or f"crewai:role:{agent_role}",
+                "id": agent_id or f"crewai:role:{agent_role}:instance_{fallback_instance_id}",
                 "role": agent_role,
+                "instance_id": fallback_instance_id,
             }
+            if parent_agent_id:
+                agent_info["parent_agent_id"] = parent_agent_id
     task_id, task_desc = _extract_task_info(task)
 
     # Tool info for tool events
@@ -571,6 +625,11 @@ def evt_from_crewai_event(
     # Add extended agent info to attrs for queryable storage
     # (agent.id and agent.role go into indexed columns, rest goes here)
     if agent_info:
+        # Instance tracking for concurrent agent execution
+        if agent_info.get("instance_id"):
+            attrs["agent_instance_id"] = agent_info["instance_id"]
+        if agent_info.get("parent_agent_id"):
+            attrs["parent_agent_id"] = agent_info["parent_agent_id"]
         if agent_info.get("allow_delegation") is not None:
             attrs["agent_allow_delegation"] = agent_info["allow_delegation"]
         if agent_info.get("goal"):

@@ -23,6 +23,62 @@ from ..ids import new_span_id
 if TYPE_CHECKING:
     from ..run import ArzuleRun
 
+
+def _generate_instance_id() -> str:
+    """Generate a unique instance identifier for agent tracking.
+
+    Returns:
+        A short unique identifier (8 characters) for agent instance.
+    """
+    return uuid.uuid4().hex[:8]
+
+
+def _get_agent_instance_id(task: Any) -> Optional[str]:
+    """Extract instance_id from a task's agent if available.
+
+    Looks for instance_id in:
+    1. agent._arzule_instance_id (set by our instrumentation)
+    2. agent.instance_id (if agent tracks it directly)
+
+    Args:
+        task: The CrewAI task object.
+
+    Returns:
+        The instance_id if found, None otherwise.
+    """
+    agent = getattr(task, "agent", None)
+    if not agent:
+        return None
+
+    # Check for arzule-specific instance tracking
+    instance_id = getattr(agent, "_arzule_instance_id", None)
+    if instance_id:
+        return instance_id
+
+    # Check for direct instance_id attribute
+    instance_id = getattr(agent, "instance_id", None)
+    if instance_id:
+        return instance_id
+
+    return None
+
+
+def _build_agent_id(role: str, instance_id: Optional[str] = None) -> str:
+    """Build agent ID using instance-aware format when available.
+
+    Args:
+        role: The agent role.
+        instance_id: Optional instance ID for uniqueness.
+
+    Returns:
+        Agent ID in format:
+        - "crewai:role:{role}:instance_{instance_id}" when instance_id is provided
+        - "crewai:role:{role}" as fallback for backward compatibility
+    """
+    if instance_id:
+        return f"crewai:role:{role}:instance_{instance_id}"
+    return f"crewai:role:{role}"
+
 # =============================================================================
 # Payload Size Limits
 # =============================================================================
@@ -203,25 +259,32 @@ def detect_task_context_handoff(
     context_sources = []
     combined_context_parts = []
     from_agents = []
-    
+    first_from_instance_id: Optional[str] = None  # For building agent ID
+
     for ctx_task in context_tasks:
         # Get info about the providing task
         providing_agent = _get_agent_role(ctx_task)
         providing_task_id = _get_task_identifier(ctx_task)
         ctx_output = _get_task_output(ctx_task)
         ctx_description = _get_task_description(ctx_task)
+        providing_instance_id = _get_agent_instance_id(ctx_task)
         # Use task display name as fallback when agent role is unknown
         providing_display = providing_agent or _get_task_display_name(ctx_task)
-        
+
+        # Track first instance_id for the "from" agent in the event
+        if first_from_instance_id is None and providing_instance_id:
+            first_from_instance_id = providing_instance_id
+
         source_info = {
             "task_id": providing_task_id,
             "agent_role": providing_display,
+            "agent_instance_id": providing_instance_id,
             "description": ctx_description,
             "output": ctx_output,
         }
         context_sources.append(source_info)
         from_agents.append(providing_display)
-        
+
         if ctx_output:
             combined_context_parts.append(f"[{providing_display}]: {ctx_output}")
     
@@ -269,8 +332,9 @@ def detect_task_context_handoff(
         "ts": run.now(),
         # Use first agent as the "from" agent for the event, but all are in payload
         "agent": {
-            "id": f"crewai:role:{from_agents[0]}" if from_agents else None,
+            "id": _build_agent_id(from_agents[0], first_from_instance_id) if from_agents else None,
             "role": from_agents[0] if from_agents else None,
+            "instance_id": first_from_instance_id,
         } if from_agents else None,
         "event_type": "handoff.proposed",
         "status": "ok",
@@ -361,6 +425,7 @@ def emit_implicit_handoff_complete(
     """
     task_id = _get_task_identifier(task)
     agent_role = _get_agent_role(task)
+    agent_instance_id = _get_agent_instance_id(task)
     task_output = _get_task_output(task)
     task_description = _get_task_description(task)
     # Use task display name as fallback when agent role is unknown
@@ -508,8 +573,9 @@ def emit_implicit_handoff_complete(
             "seq": run.next_seq(),
             "ts": run.now(),
             "agent": {
-                "id": f"crewai:role:{agent_role}" if agent_role else None,
+                "id": _build_agent_id(agent_role, agent_instance_id) if agent_role else None,
                 "role": agent_role,
+                "instance_id": agent_instance_id,
             } if agent_role else None,
             "event_type": "handoff.complete",
             "status": status,
@@ -526,7 +592,7 @@ def emit_implicit_handoff_complete(
         run._handoff_pending.pop(key, None)
     
     # Store this task as the last completed for sequential tracking
-    _store_last_completed_task(run.run_id, task, task_output, agent_role, task_id, task_description)
+    _store_last_completed_task(run.run_id, task, task_output, agent_role, agent_instance_id, task_id, task_description)
     
     return completed_count
 
@@ -540,6 +606,7 @@ def _store_last_completed_task(
     task: Any,
     output: Optional[str],
     agent_role: Optional[str],
+    agent_instance_id: Optional[str],
     task_id: str,
     description: Optional[str],
 ) -> None:
@@ -549,6 +616,7 @@ def _store_last_completed_task(
             "task": task,
             "output": output,
             "agent_role": agent_role,
+            "agent_instance_id": agent_instance_id,
             "task_id": task_id,
             "description": description,
             "output_hash": _compute_content_hash(output),
@@ -595,16 +663,17 @@ def detect_sequential_handoff(
     
     current_agent = _get_agent_role(task)
     previous_agent = last_task.get("agent_role")
-    
+    previous_agent_instance_id = last_task.get("agent_instance_id")
+
     # Only emit handoff if agents are different
     # Same agent continuing work isn't a handoff
     if current_agent == previous_agent:
         return None
-    
+
     # Both agents should be known for meaningful analysis
     if not current_agent or not previous_agent:
         return None
-    
+
     current_task_id = _get_task_identifier(task)
     previous_task_id = last_task.get("task_id")
     previous_output = last_task.get("output")
@@ -652,8 +721,9 @@ def detect_sequential_handoff(
         "seq": run.next_seq(),
         "ts": run.now(),
         "agent": {
-            "id": f"crewai:role:{previous_agent}",
+            "id": _build_agent_id(previous_agent, previous_agent_instance_id),
             "role": previous_agent,
+            "instance_id": previous_agent_instance_id,
         },
         "event_type": "handoff.proposed",
         "status": "ok",
