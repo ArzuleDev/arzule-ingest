@@ -100,6 +100,8 @@ def normalize_tool_start(
     agent_role: str,
     span_id: str,
     parent_span_id: Optional[str] = None,
+    handoff_key: Optional[str] = None,
+    subagent_type: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Normalize a tool call start event.
@@ -113,12 +115,24 @@ def normalize_tool_start(
         agent_role: Current agent role
         span_id: Span ID for this tool call
         parent_span_id: Optional parent span
+        handoff_key: Optional handoff key for subagent correlation
+        subagent_type: Optional subagent type for lane assignment
 
     Returns:
         TraceEvent dict
     """
     # Build summary based on tool
     summary = _build_tool_summary(tool_name, tool_input)
+
+    # Build attrs with optional subagent correlation fields
+    attrs: dict[str, Any] = {
+        "tool_name": tool_name,
+        "tool_use_id": tool_use_id,
+    }
+    if handoff_key:
+        attrs["handoff_key"] = handoff_key
+    if subagent_type:
+        attrs["subagent_type"] = subagent_type
 
     return normalize_event(
         run,
@@ -128,10 +142,7 @@ def normalize_tool_start(
         summary=summary,
         span_id=span_id,
         parent_span_id=parent_span_id,
-        attrs={
-            "tool_name": tool_name,
-            "tool_use_id": tool_use_id,
-        },
+        attrs=attrs,
         payload={
             "tool_input": _sanitize_tool_input(tool_name, tool_input),
         },
@@ -462,21 +473,42 @@ def _sanitize_tool_input(tool_name: str, tool_input: dict[str, Any]) -> dict[str
 
 
 def _sanitize_tool_output(tool_name: str, tool_output: Any) -> Any:
-    """Sanitize tool output for safe storage."""
+    """Sanitize tool output for safe storage.
+    
+    Truncates very large outputs to keep payloads reasonable.
+    WAF SizeRestrictions_BODY is excluded for ingest endpoint.
+    """
+    # 20KB limit - captures most outputs while keeping payloads reasonable
+    MAX_OUTPUT_SIZE = 20000
+    
     if tool_output is None:
         return None
 
     if isinstance(tool_output, str):
-        # Truncate large outputs
-        return truncate_string(tool_output, 50000)
+        # Truncate large outputs to stay under WAF limit
+        if len(tool_output) > MAX_OUTPUT_SIZE:
+            return tool_output[:MAX_OUTPUT_SIZE] + f"\n\n[... truncated, full length: {len(tool_output)} chars]"
+        return tool_output
 
     if isinstance(tool_output, dict):
-        return sanitize(tool_output)
+        sanitized = sanitize(tool_output)
+        # Check serialized size
+        serialized = str(sanitized)
+        if len(serialized) > MAX_OUTPUT_SIZE:
+            return {"_truncated": True, "_full_length": len(serialized), "_preview": serialized[:MAX_OUTPUT_SIZE]}
+        return sanitized
 
     if isinstance(tool_output, list):
-        return sanitize(tool_output)
+        sanitized = sanitize(tool_output)
+        serialized = str(sanitized)
+        if len(serialized) > MAX_OUTPUT_SIZE:
+            return {"_truncated": True, "_full_length": len(serialized), "_preview": serialized[:MAX_OUTPUT_SIZE]}
+        return sanitized
 
-    return truncate_string(str(tool_output), 50000)
+    output_str = str(tool_output)
+    if len(output_str) > MAX_OUTPUT_SIZE:
+        return output_str[:MAX_OUTPUT_SIZE] + f"\n\n[... truncated, full length: {len(output_str)} chars]"
+    return output_str
 
 
 def _get_subagent_tools(subagent_type: str) -> list[str]:

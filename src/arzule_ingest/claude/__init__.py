@@ -61,6 +61,7 @@ from .turn import (
     get_current_turn,
     get_or_create_run,
     update_turn_state,
+    emit_with_seq_sync,
 )
 # Backwards compatibility - deprecated, use turn-based API
 from .session import get_or_create_session, get_session_state
