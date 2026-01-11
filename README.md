@@ -6,6 +6,7 @@ Lightweight SDK for capturing multi-agent traces and sending them to Arzule.
 - CrewAI
 - LangChain / LangGraph
 - Microsoft AutoGen (both legacy v0.2 and new v0.7+)
+- Claude Code (via hooks + OTel)
 
 ## Installation
 
@@ -35,14 +36,18 @@ Required environment variables:
 ### Option 2: Explicit configuration
 
 ```python
+import os
 import arzule_ingest
 
+# Always use environment variables for credentials - NEVER hardcode API keys
 arzule_ingest.init(
-    api_key="your-api-key",
-    tenant_id="your-tenant-id",
-    project_id="your-project-id",
+    api_key=os.environ["ARZULE_API_KEY"],
+    tenant_id=os.environ["ARZULE_TENANT_ID"],
+    project_id=os.environ["ARZULE_PROJECT_ID"],
 )
 ```
+
+> **Security Note:** Never hardcode API keys in source code. Use environment variables or a secrets manager.
 
 ## Framework-Specific Usage
 
@@ -130,6 +135,76 @@ asyncio.run(main())
 
 **Note:** The SDK automatically detects which version of AutoGen you have installed. For detailed AutoGen v0.7+ documentation, see [AUTOGEN_V2_INTEGRATION.md](AUTOGEN_V2_INTEGRATION.md).
 
+### Claude Code
+
+Capture traces from Claude Code CLI sessions with full observability.
+
+#### Quick Start (Recommended)
+
+Use the `arzule-claude` wrapper for complete observability (hooks + OTel metrics):
+
+```bash
+# Instead of running:
+$ claude "your prompt"
+
+# Run:
+$ arzule-claude "your prompt"
+
+# All arguments pass through:
+$ arzule-claude --model opus "your prompt"
+```
+
+This captures:
+- **Hooks data**: Session events, tool calls, user prompts, subagent activity
+- **OTel metrics**: Token usage, costs, latency, cache metrics
+
+#### Installation
+
+```bash
+# Install the SDK
+pip install arzule-ingest
+
+# Configure credentials (one-time setup)
+arzule configure
+```
+
+#### Alternative: Hooks-Only Installation
+
+If you prefer to use the regular `claude` command with just hooks (no OTel metrics):
+
+```bash
+# Install hooks into Claude Code settings
+arzule-claude-install install
+
+# Check installation status
+arzule-claude-install status
+
+# Uninstall hooks
+arzule-claude-install uninstall
+```
+
+#### What Gets Captured
+
+| Data Type | `arzule-claude` | Hooks-only |
+|-----------|-----------------|------------|
+| Session start/end | ✅ | ✅ |
+| User prompts | ✅ | ✅ |
+| Tool calls (pre/post) | ✅ | ✅ |
+| Subagent activity | ✅ | ✅ |
+| Token usage | ✅ | ❌ |
+| Costs | ✅ | ❌ |
+| Latency metrics | ✅ | ❌ |
+
+#### Configuration
+
+The wrapper reads configuration from `~/.arzule/config` (created by `arzule configure`) or environment variables:
+
+```bash
+export ARZULE_API_KEY="your-api-key"
+export ARZULE_TENANT_ID="your-tenant-id"
+export ARZULE_PROJECT_ID="your-project-id"
+```
+
 ## What Gets Captured
 
 The SDK automatically captures framework-specific events:
@@ -157,6 +232,14 @@ The SDK automatically captures framework-specific events:
 - **Code execution** - `code.execution` (v0.2 only)
 - **Handoffs** - `handoff.proposed`, `handoff.ack`, `handoff.complete`
 - **Agent events** - `agent.event` (v0.7+ only)
+
+### Claude Code
+- **Sessions** - `session.start`, `session.end`
+- **Turns** - `turn.start`, `turn.end`
+- **Tool calls** - `tool.call.start`, `tool.call.end`
+- **Subagents** - `subagent.start`, `subagent.stop`
+- **User prompts** - `user.prompt.submit`
+- **Notifications** - `notification`
 
 ## TraceEvent Format
 
