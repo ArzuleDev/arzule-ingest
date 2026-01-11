@@ -59,20 +59,19 @@ def _extract_payload_keys(payload: Any, max_keys: int = 15) -> list[str]:
 
 def _build_agent_id(role: str, instance_id: Optional[str] = None) -> str:
     """
-    Build an agent ID in the instance-aware format for consistency with normalize.py.
+    Build an agent ID using role-based format for visualization swimlane consolidation.
 
-    Uses the new format: crewai:role:{role}:instance_{instance_id}
-    Falls back to old format: crewai:role:{role} when no instance_id is available.
+    Always returns crewai:role:{role} regardless of instance_id.
+    The instance_id parameter is kept for API compatibility but ignored -
+    instance tracking is done via the separate instance_id field in agent_info.
 
     Args:
         role: The agent's role name
-        instance_id: Optional instance identifier for the agent
+        instance_id: Ignored (kept for API compatibility)
 
     Returns:
-        Agent ID string in the appropriate format
+        Agent ID string in format crewai:role:{role}
     """
-    if instance_id:
-        return f"crewai:role:{role}:instance_{instance_id}"
     return f"crewai:role:{role}"
 
 

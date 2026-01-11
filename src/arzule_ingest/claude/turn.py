@@ -186,8 +186,9 @@ def get_current_turn(session_id: str) -> Optional[dict]:
                     existing["tool_calls"] = disk_state.get("tool_calls", [])
                     existing["current_seq"] = disk_state.get("current_seq", 0)
                     # Also copy any other fields that might have been updated
-                    for key in ["last_subagent_result", "last_subagent_transcript", 
-                               "last_subagent_id", "active_subagents", "compaction_count"]:
+                    for key in ["last_subagent_result", "last_subagent_transcript",
+                               "last_subagent_id", "active_subagents", "compaction_count",
+                               "pending_prompt_matches", "agent_to_task_mapping"]:
                         if key in disk_state:
                             existing[key] = disk_state[key]
                 return _active_turns[session_id]
@@ -290,39 +291,58 @@ def get_or_create_run(session_id: str) -> Any:
 
 def update_turn_state(session_id: str, updates: dict) -> None:
     """Update the current turn's state.
-    
+
     Uses file locking to handle parallel hook invocations safely.
     This is critical for parallel tool calls (e.g., multiple WebSearch).
-    
+
     For list fields (tool_calls, spans), we MERGE by adding new items.
     For dict fields (tool_inputs, active_subagents), we MERGE by combining keys.
     For scalar fields, we use the update value.
     """
+    _log_debug(f"update_turn_state: session_id={session_id}, updates.keys={list(updates.keys())}")
+
     # Use file lock to prevent parallel processes from overwriting each other
     with _file_lock(session_id):
         with _turn_lock:
             if session_id not in _active_turns:
-                return
+                _log_debug(f"update_turn_state: session_id NOT in _active_turns, checking disk")
+                # Try to load from disk (hooks are separate processes)
+                disk_state = _load_turn_state_unlocked(session_id)
+                if disk_state and "turn_id" in disk_state:
+                    _log_debug(f"update_turn_state: loaded from disk, turn_id={disk_state.get('turn_id')}")
+                    disk_state["run"] = _recreate_run(disk_state)
+                    _active_turns[session_id] = disk_state
+                else:
+                    _log_debug(f"update_turn_state: no disk state found, returning")
+                    return
             
             existing = _active_turns[session_id]
-            
+
             # Reload from disk to get any changes from parallel processes
             disk_state = _load_turn_state_unlocked(session_id)
             if disk_state and "turn_id" in disk_state:
+                disk_subagents = disk_state.get("active_subagents", {})
+                mem_subagents = existing.get("active_subagents", {})
+                _log_debug(f"update_turn_state INSIDE LOCK: disk_subagents={list(disk_subagents.keys())}, mem_subagents={list(mem_subagents.keys())}")
+
                 # Start with disk state as the base for mergeable fields
                 existing["spans"] = disk_state.get("spans", [])
                 existing["current_seq"] = disk_state.get("current_seq", 0)
-                
+
                 # For dicts, merge disk + memory
                 for dict_key in ["tool_inputs", "active_subagents"]:
                     disk_dict = disk_state.get(dict_key, {})
                     mem_dict = existing.get(dict_key, {})
                     existing[dict_key] = {**disk_dict, **mem_dict}
-                
+
+                _log_debug(f"update_turn_state AFTER MERGE: active_subagents={list(existing.get('active_subagents', {}).keys())}")
+
                 # For tool_calls list, we need to merge by tool_use_id
                 disk_tool_calls = disk_state.get("tool_calls", [])
                 existing["tool_calls"] = disk_tool_calls
-            
+            else:
+                _log_debug(f"update_turn_state INSIDE LOCK: NO disk_state found!")
+
             # Now apply updates with proper merging
             for key, value in updates.items():
                 if key == "tool_calls" and isinstance(value, list):
@@ -346,14 +366,20 @@ def update_turn_state(session_id: str, updates: dict) -> None:
                 elif key in ["tool_inputs", "active_subagents"] and isinstance(value, dict):
                     # Merge dicts
                     existing_dict = existing.get(key, {})
+                    before_keys = list(existing_dict.keys())
                     existing_dict.update(value)
                     existing[key] = existing_dict
-                    
+                    if key == "active_subagents":
+                        _log_debug(f"update_turn_state APPLY UPDATE: {key} before={before_keys}, adding={list(value.keys())}, after={list(existing_dict.keys())}")
+
                 else:
                     # Scalar value - just update
                     existing[key] = value
-            
+
+            final_subagents = list(existing.get("active_subagents", {}).keys())
+            _log_debug(f"update_turn_state BEFORE PERSIST: active_subagents={final_subagents}")
             _persist_turn_state_unlocked(session_id, existing)
+            _log_debug(f"update_turn_state PERSISTED: active_subagents={final_subagents}")
 
 
 def push_span(session_id: str, **span_info) -> str:
@@ -372,11 +398,17 @@ def push_span(session_id: str, **span_info) -> str:
             # Reload from disk to get any changes from parallel processes
             disk_state = _load_turn_state_unlocked(session_id)
             if disk_state and "turn_id" in disk_state:
-                # Merge disk state into memory
+                # Merge disk state into memory - CRITICAL: merge ALL dict fields
+                # to avoid overwriting parallel updates from other processes
                 if session_id in _active_turns:
                     _active_turns[session_id]["spans"] = disk_state.get("spans", [])
                     _active_turns[session_id]["current_seq"] = disk_state.get("current_seq", 0)
-            
+                    # Merge dict fields from disk (parallel processes may have added entries)
+                    for dict_key in ["tool_inputs", "active_subagents", "agent_to_task_mapping", "pending_prompt_matches"]:
+                        disk_dict = disk_state.get(dict_key, {})
+                        mem_dict = _active_turns[session_id].get(dict_key, {})
+                        _active_turns[session_id][dict_key] = {**disk_dict, **mem_dict}
+
             if session_id in _active_turns:
                 _active_turns[session_id].setdefault("spans", []).append(span_info)
                 # Persist to disk so subsequent hooks see this span
@@ -399,7 +431,12 @@ def pop_span(session_id: str, tool_use_id: str = None) -> Optional[dict]:
                 if session_id in _active_turns:
                     _active_turns[session_id]["spans"] = disk_state.get("spans", [])
                     _active_turns[session_id]["current_seq"] = disk_state.get("current_seq", 0)
-            
+                    # Merge dict fields from disk (parallel processes may have added entries)
+                    for dict_key in ["tool_inputs", "active_subagents", "agent_to_task_mapping", "pending_prompt_matches"]:
+                        disk_dict = disk_state.get(dict_key, {})
+                        mem_dict = _active_turns[session_id].get(dict_key, {})
+                        _active_turns[session_id][dict_key] = {**disk_dict, **mem_dict}
+
             if session_id in _active_turns:
                 spans = _active_turns[session_id].get("spans", [])
                 result = None
@@ -410,7 +447,7 @@ def pop_span(session_id: str, tool_use_id: str = None) -> Optional[dict]:
                             break
                 elif spans:
                     result = spans.pop()
-                
+
                 if result is not None:
                     # Persist to disk so subsequent hooks see the updated stack
                     _persist_turn_state_unlocked(session_id, _active_turns[session_id])
@@ -522,7 +559,6 @@ def _persist_turn_state_unlocked(session_id: str, turn_info: dict) -> None:
     """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     state_file = STATE_DIR / f"turn_{session_id}.json"
-    temp_file = STATE_DIR / f"turn_{session_id}.json.tmp"
     
     # Don't persist the run object itself, but DO persist the seq counter
     state = {k: v for k, v in turn_info.items() if k != "run"}
@@ -534,16 +570,18 @@ def _persist_turn_state_unlocked(session_id: str, turn_info: dict) -> None:
     # The current_seq in turn_info is already correct from emit_with_seq_sync.
     
     try:
-        # Atomic write: write to temp file first, then rename
-        # This prevents other processes from reading partial/corrupted JSON
-        temp_file.write_text(json.dumps(state, default=str))
-        temp_file.rename(state_file)
-    except Exception:
-        # Clean up temp file if rename failed
-        try:
-            temp_file.unlink(missing_ok=True)
-        except Exception:
-            pass
+        # Direct write with fsync - no atomic rename needed since we have file lock
+        # This avoids directory metadata caching issues on macOS where rename
+        # visibility can be delayed even after fsync
+        #
+        # The file lock already ensures only one process writes at a time,
+        # so we don't need atomic rename for crash safety during parallel writes.
+        with open(state_file, 'w') as f:
+            f.write(json.dumps(state, default=str))
+            f.flush()
+            os.fsync(f.fileno())  # Force write to disk
+    except Exception as e:
+        _log_debug(f"_persist_turn_state_unlocked: error writing state: {e}")
 
 
 def _load_turn_state_unlocked(session_id: str) -> Optional[dict]:

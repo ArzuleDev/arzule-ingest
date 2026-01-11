@@ -5,7 +5,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ..ids import new_span_id
+from ..logger import get_logger
 from ..sanitize import sanitize, truncate_string
+
+logger = get_logger()
 
 if TYPE_CHECKING:
     from ..run import ArzuleRun
@@ -170,7 +173,13 @@ def _extract_token_usage(response: Any) -> Optional[Dict[str, int]]:
                 result["completion_tokens"] = int(usage["completion_tokens"])
             if "total_tokens" in usage:
                 result["total_tokens"] = int(usage["total_tokens"])
-    
+
+    # Debug logging for token extraction
+    if result:
+        logger.debug(f"[arzule] LangGraph token usage extracted: {result}")
+    else:
+        logger.debug(f"[arzule] LangGraph no token usage found. Response type: {type(response).__name__}")
+
     return result if result else None
 
 

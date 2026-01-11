@@ -143,6 +143,7 @@ def handle_hook() -> None:
             "SessionEnd": handle_session_end,
             "PreToolUse": handle_pre_tool_use,
             "PostToolUse": handle_post_tool_use,
+            "SubagentStart": handle_subagent_start,
             "SubagentStop": handle_subagent_stop,
             "UserPromptSubmit": handle_user_prompt,
             "Stop": handle_stop,
@@ -310,7 +311,7 @@ def handle_user_prompt(input_data: dict) -> None:
     run = turn_info["run"]
 
     # Emit turn.start event with atomic seq sync
-    # Include prompt_summary in both summary and payload for dashboard display
+    # Include FULL prompt in payload for dashboard display (not truncated)
     emit_with_seq_sync(session_id, run, normalize_event(
         run,
         event_type="turn.start",
@@ -322,7 +323,7 @@ def handle_user_prompt(input_data: dict) -> None:
         },
         payload={
             "prompt_length": len(prompt),
-            "user_prompt": prompt_summary,  # Include summary for dashboard display
+            "user_prompt": prompt,  # Include FULL prompt for dashboard display
         },
     ))
 
@@ -489,17 +490,29 @@ def _handle_task_start(run: Any, session_id: str, tool_use_id: str, tool_input: 
     prompt = tool_input.get("prompt", "")
     model = tool_input.get("model")
 
+    _log_error(f"_handle_task_start: tool_use_id={tool_use_id}, subagent_type={subagent_type}")
+    _log_error(f"_handle_task_start: BEFORE active_subagents={list(turn_info.get('active_subagents', {}).keys())}")
+
     # Create handoff tracking
     handoff_key = create_handoff(session_id, tool_use_id, subagent_type, description)
 
     # Track active subagent and persist to disk for subsequent hooks
     # Store the prompt so we can correlate SubagentStop with the correct tool_use_id
-    turn_info.setdefault("active_subagents", {})[tool_use_id] = {
-        "type": subagent_type,
-        "prompt": prompt,  # Used for correlation in SubagentStop
-        "started_at": _now_iso(),
+    # CRITICAL: Pass ONLY the new entry to update_turn_state, not the whole dict
+    # This ensures proper atomic merge with entries from parallel processes
+    new_subagent_entry = {
+        tool_use_id: {
+            "type": subagent_type,
+            "prompt": prompt,  # Used for correlation in SubagentStop
+            "started_at": _now_iso(),
+        }
     }
-    update_turn_state(session_id, {"active_subagents": turn_info["active_subagents"]})
+    # Also update local turn_info for consistency within this process
+    turn_info.setdefault("active_subagents", {})[tool_use_id] = new_subagent_entry[tool_use_id]
+    _log_error(f"_handle_task_start: AFTER active_subagents={list(turn_info['active_subagents'].keys())}")
+    # Pass only the NEW entry, not the whole dict - update_turn_state will merge with disk
+    update_turn_state(session_id, {"active_subagents": new_subagent_entry})
+    _log_error(f"_handle_task_start: PERSISTED active_subagents for {tool_use_id}")
 
     # Create span for the delegation (push_span already persists)
     span_id = push_span(session_id, tool_use_id=tool_use_id, subagent_type=subagent_type)
@@ -539,48 +552,55 @@ def _handle_regular_tool_start(
     # Create span for the tool call
     span_id = push_span(session_id, tool_use_id=tool_use_id)
 
-    # Get current agent context
-    agent_id = _get_current_agent_id(session_id, turn_info)
-    agent_role = _get_current_agent_role(turn_info)
+    # Get current agent context (pass tool_input for content-based matching with parallel subagents)
+    agent_id = _get_current_agent_id(session_id, turn_info, tool_input)
+    agent_role = _get_current_agent_role(turn_info, tool_input)
 
     # Find the parent span for this tool call
     # If inside a subagent (Task), the parent should be the Task span so frontend
     # can walk the parent_span_id chain to find the handoff context
     spans = turn_info.get("spans", [])
+    subagent_spans = [s for s in spans if s.get("subagent_type")]
     parent_span_id = None
     handoff_key = None
     subagent_type = None
 
-    # CRITICAL FIX: For parallel subagents, use current_executing_subagent to find the correct span
-    # This is set in UserPromptSubmit when a subagent starts executing
-    current_executing = turn_info.get("current_executing_subagent")
+    if subagent_spans:
+        matched_span = None
 
-    if current_executing:
-        # Look up the span in turn_info["spans"] where turn.push_span stores them
-        # NOTE: We can't use spanctx.get_span_by_tool_use because that looks in a different
-        # storage location (session_state["spans_by_tool_use"]) which turn.push_span doesn't populate.
-        for span in turn_info.get("spans", []):
-            if span.get("tool_use_id") == current_executing and span.get("subagent_type"):
-                parent_span_id = span.get("span_id")
-                subagent_type = span.get("subagent_type")
-                handoff_key = generate_handoff_key(session_id, current_executing)
-                _log_error(f"PreToolUse[{tool_name}]: using current_executing_subagent={current_executing}, parent_span_id={parent_span_id}, handoff_key={handoff_key}")
-                break
+        # SINGLE SUBAGENT: Use it directly
+        if len(subagent_spans) == 1:
+            matched_span = subagent_spans[0]
+            _log_error(f"PreToolUse[{tool_name}]: single subagent, using span {matched_span.get('tool_use_id')}")
 
-    # Fallback: iterate spans (for nested contexts or single subagent)
-    if not parent_span_id:
-        for span in reversed(spans):
-            if span.get("subagent_type"):
-                parent_span_id = span.get("span_id")
-                subagent_type = span.get("subagent_type")
-                # Get the handoff_key for this subagent instance
-                span_tool_use_id = span.get("tool_use_id")
-                if span_tool_use_id:
-                    # Generate handoff_key directly - it's the deterministic hash
-                    # of session_id + tool_use_id (not stored in handoff dict)
-                    handoff_key = generate_handoff_key(session_id, span_tool_use_id)
-                _log_error(f"PreToolUse[{tool_name}]: FALLBACK setting parent_span_id={parent_span_id}, handoff_key={handoff_key} from subagent span (type={subagent_type}, tool_use_id={span_tool_use_id})")
-                break
+        # MULTIPLE SUBAGENTS: Try content-based matching first
+        elif tool_input:
+            matched_span = _match_tool_to_subagent(tool_input, turn_info)
+            if matched_span:
+                _log_error(f"PreToolUse[{tool_name}]: content-matched to subagent {matched_span.get('tool_use_id')}")
+
+        # FALLBACK: Try current_executing_subagent
+        if not matched_span:
+            current_executing = turn_info.get("current_executing_subagent")
+            if current_executing:
+                for span in subagent_spans:
+                    if span.get("tool_use_id") == current_executing:
+                        matched_span = span
+                        _log_error(f"PreToolUse[{tool_name}]: using current_executing_subagent={current_executing}")
+                        break
+
+        # LAST RESORT: Use most recent subagent span
+        if not matched_span:
+            matched_span = subagent_spans[-1]
+            _log_error(f"PreToolUse[{tool_name}]: LAST RESORT using most recent span {matched_span.get('tool_use_id')}")
+
+        # Extract values from matched span
+        if matched_span:
+            parent_span_id = matched_span.get("span_id")
+            subagent_type = matched_span.get("subagent_type")
+            span_tool_use_id = matched_span.get("tool_use_id")
+            if span_tool_use_id:
+                handoff_key = generate_handoff_key(session_id, span_tool_use_id)
 
     # Debug: log agent context for tool calls (helps verify subagent attribution)
     _log_error(f"PreToolUse[{tool_name}]: agent_id={agent_id}, agent_role={agent_role}, spans_count={len(spans)}, parent_span_id={parent_span_id}, handoff_key={handoff_key}")
@@ -820,79 +840,189 @@ def _handle_regular_tool_complete(
 
 def handle_subagent_stop(input_data: dict) -> None:
     """Handle SubagentStop hook - emit agent.end for subagent.
-    
+
     IMPORTANT: Per Claude Code CHANGELOG 2.0.42, SubagentStop provides:
     - agent_id: The subagent's ID (e.g., "ac9ca42")
     - agent_transcript_path: Path to the SUBAGENT's transcript (not main session)
-    
+
     The subagent's result is the last assistant message in its transcript.
+
+    RACE CONDITION FIX: For parallel same-type subagents, SubagentStart marks them as
+    "pending_prompt_match". Here we resolve the mapping using compute_prompt_similarity()
+    to match the subagent's first user message against the Task prompts stored in active_subagents.
     """
     session_id = input_data["session_id"]
-    
+
     # Debug: Log all input data keys to understand what Claude Code sends
     _log_error(f"SubagentStop: input_data keys={list(input_data.keys())}")
-    
+
     # Use the correct field names from Claude Code 2.0.42+
     agent_id = input_data.get("agent_id")
     agent_transcript_path = input_data.get("agent_transcript_path")
     # Fallback for older versions
     transcript_path = input_data.get("transcript_path") or agent_transcript_path
-    
+
     _log_error(f"SubagentStop: agent_id={agent_id}, agent_transcript_path={agent_transcript_path}, transcript_path={transcript_path}")
 
+    # Try to get turn_info, but don't fail if missing
+    # SubagentStop can still extract tool_use_ids from agent_transcript_path
     turn_info = get_current_turn(session_id)
     if not turn_info:
-        _log_error(f"SubagentStop: no turn_info for session {session_id}")
-        return
-    
-    run = turn_info["run"]
+        _log_error(f"SubagentStop: no turn_info for session {session_id}, using get_or_create_run")
+        # Create a minimal turn_info with just what we need
+        run = get_or_create_run(session_id)
+        turn_info = {"run": run, "active_subagents": {}, "agent_to_task_mapping": {}, "pending_prompt_matches": {}}
+    else:
+        run = turn_info["run"]
 
     # Look up subagent type from multiple sources
     # SubagentStop fires BEFORE PostToolUse for Task, so handoff info should still exist
     subagent_type = "Subagent"  # Fallback
     matched_tool_use_id = None
-    
-    # STRATEGY 1: Use get_active_handoffs from session state (most reliable persistence)
-    # This is stored in file-based session state, not in-memory turn_info
-    active_handoffs = get_active_handoffs(session_id)
-    _log_error(f"SubagentStop: found {len(active_handoffs)} active handoffs")
-    
-    if len(active_handoffs) == 1:
-        # Single subagent case - use this handoff's type
-        handoff = active_handoffs[0]
-        subagent_type = handoff.get("subagent_type", "Subagent")
-        matched_tool_use_id = handoff.get("tool_use_id")
-        _log_error(f"SubagentStop: single handoff, type={subagent_type}")
-    elif len(active_handoffs) > 1:
-        # Multiple parallel subagents - try prompt matching
-        _log_error(f"SubagentStop: {len(active_handoffs)} parallel subagents, trying prompt match")
-        if agent_transcript_path and os.path.exists(agent_transcript_path):
-            subagent_prompt = _extract_first_user_message(agent_transcript_path)
-            if subagent_prompt:
-                # Get prompts from active_subagents in turn_info (includes stored prompts)
+
+    # STRATEGY 0 (BEST): Use agent_to_task_mapping built in SubagentStart
+    # This is the most reliable method when FIFO was unambiguous (single subagent of type)
+    agent_to_task_mapping = turn_info.get("agent_to_task_mapping", {})
+    if agent_id and agent_id in agent_to_task_mapping:
+        matched_tool_use_id = agent_to_task_mapping[agent_id]
+        # Look up subagent_type from active_subagents
+        active_subagents = turn_info.get("active_subagents", {})
+        if matched_tool_use_id in active_subagents:
+            subagent_type = active_subagents[matched_tool_use_id].get("type", "Subagent")
+        _log_error(f"SubagentStop: MAPPED via SubagentStart! agent_id={agent_id} -> tool_use_id={matched_tool_use_id}, type={subagent_type}")
+
+    # STRATEGY 1 (NEW): Resolve pending_prompt_match using fuzzy prompt matching
+    # This handles parallel same-type subagents where FIFO was ambiguous
+    if not matched_tool_use_id:
+        pending_prompt_matches = turn_info.get("pending_prompt_matches", {})
+        if agent_id and agent_id in pending_prompt_matches:
+            pending_info = pending_prompt_matches[agent_id]
+            candidate_tool_use_ids = pending_info.get("candidate_tool_use_ids", [])
+            _log_error(f"SubagentStop: resolving pending_prompt_match for agent_id={agent_id}, candidates={candidate_tool_use_ids}")
+
+            # Extract subagent's first user message from its transcript
+            subagent_prompt = None
+            if agent_transcript_path and os.path.exists(agent_transcript_path):
+                subagent_prompt = _extract_first_user_message(agent_transcript_path)
+                _log_error(f"SubagentStop: extracted subagent_prompt length={len(subagent_prompt) if subagent_prompt else 0}")
+
+            if subagent_prompt and candidate_tool_use_ids:
                 active_subagents = turn_info.get("active_subagents", {})
-                for tool_use_id, info in active_subagents.items():
-                    stored_prompt = info.get("prompt", "")
-                    if stored_prompt and (stored_prompt == subagent_prompt or 
-                                           stored_prompt in subagent_prompt or 
-                                           subagent_prompt in stored_prompt):
+                best_match_id = None
+                best_similarity = 0.0
+
+                # Score each candidate Task prompt against the subagent's actual prompt
+                for tool_use_id in candidate_tool_use_ids:
+                    info = active_subagents.get(tool_use_id, {})
+                    task_prompt = info.get("prompt", "")
+                    if not task_prompt:
+                        continue
+
+                    similarity = compute_prompt_similarity(subagent_prompt, task_prompt)
+                    _log_error(f"SubagentStop: similarity({tool_use_id})={similarity:.3f}")
+
+                    if similarity > best_similarity:
+                        best_similarity = similarity
+                        best_match_id = tool_use_id
+
+                # Use prompt match if similarity is above threshold (0.1 = 10% keyword overlap)
+                if best_match_id and best_similarity >= 0.1:
+                    matched_tool_use_id = best_match_id
+                    info = active_subagents.get(matched_tool_use_id, {})
+                    subagent_type = info.get("type", "Subagent")
+                    info["assigned_agent_id"] = agent_id
+                    _log_error(f"SubagentStop: PROMPT MATCHED agent_id={agent_id} -> tool_use_id={matched_tool_use_id}, similarity={best_similarity:.3f}")
+
+                    # Update agent_to_task_mapping now that we have a definitive match
+                    agent_to_task_mapping[agent_id] = matched_tool_use_id
+                    # Remove from pending
+                    del pending_prompt_matches[agent_id]
+                    update_turn_state(session_id, {
+                        "active_subagents": active_subagents,
+                        "agent_to_task_mapping": agent_to_task_mapping,
+                        "pending_prompt_matches": pending_prompt_matches,
+                    })
+                else:
+                    _log_error(f"SubagentStop: prompt match below threshold (best={best_similarity:.3f}), falling back to FIFO")
+                    # FIFO fallback: use first candidate
+                    if candidate_tool_use_ids:
+                        matched_tool_use_id = candidate_tool_use_ids[0]
+                        info = active_subagents.get(matched_tool_use_id, {})
                         subagent_type = info.get("type", "Subagent")
-                        matched_tool_use_id = tool_use_id
-                        _log_error(f"SubagentStop: prompt match found, type={subagent_type}")
-                        break
-        
-        # Fallback for parallel: use first active handoff
-        if not matched_tool_use_id:
+                        info["assigned_agent_id"] = agent_id
+                        agent_to_task_mapping[agent_id] = matched_tool_use_id
+                        del pending_prompt_matches[agent_id]
+                        update_turn_state(session_id, {
+                            "active_subagents": active_subagents,
+                            "agent_to_task_mapping": agent_to_task_mapping,
+                            "pending_prompt_matches": pending_prompt_matches,
+                        })
+                        _log_error(f"SubagentStop: FIFO FALLBACK agent_id={agent_id} -> tool_use_id={matched_tool_use_id}")
+
+    # STRATEGY 2: Use get_active_handoffs from session state (fallback for single subagent)
+    if not matched_tool_use_id:
+        active_handoffs = get_active_handoffs(session_id)
+        _log_error(f"SubagentStop: found {len(active_handoffs)} active handoffs")
+
+        if len(active_handoffs) == 1:
+            # Single subagent case - use this handoff's type
             handoff = active_handoffs[0]
             subagent_type = handoff.get("subagent_type", "Subagent")
             matched_tool_use_id = handoff.get("tool_use_id")
-            _log_error(f"SubagentStop: parallel fallback to first handoff, type={subagent_type}")
+            _log_error(f"SubagentStop: single handoff, type={subagent_type}")
+        elif len(active_handoffs) > 1:
+            # Multiple parallel subagents - try prompt matching (fallback if strategies 0/1 failed)
+            _log_error(f"SubagentStop: {len(active_handoffs)} parallel subagents, trying prompt match")
+            if agent_transcript_path and os.path.exists(agent_transcript_path):
+                subagent_prompt = _extract_first_user_message(agent_transcript_path)
+                if subagent_prompt:
+                    # Get prompts from active_subagents in turn_info (includes stored prompts)
+                    active_subagents = turn_info.get("active_subagents", {})
+                    best_match_id = None
+                    best_similarity = 0.0
+
+                    for tool_use_id, info in active_subagents.items():
+                        stored_prompt = info.get("prompt", "")
+                        if not stored_prompt:
+                            continue
+
+                        # Use fuzzy matching instead of substring check
+                        similarity = compute_prompt_similarity(subagent_prompt, stored_prompt)
+                        _log_error(f"SubagentStop: fallback similarity({tool_use_id})={similarity:.3f}")
+
+                        if similarity > best_similarity:
+                            best_similarity = similarity
+                            best_match_id = tool_use_id
+
+                    if best_match_id and best_similarity >= 0.1:
+                        subagent_type = active_subagents[best_match_id].get("type", "Subagent")
+                        matched_tool_use_id = best_match_id
+                        _log_error(f"SubagentStop: fallback PROMPT MATCHED, type={subagent_type}, similarity={best_similarity:.3f}")
+
+            # Fallback for parallel: use first active handoff (LAST RESORT)
+            if not matched_tool_use_id:
+                handoff = active_handoffs[0]
+                subagent_type = handoff.get("subagent_type", "Subagent")
+                matched_tool_use_id = handoff.get("tool_use_id")
+                _log_error(f"SubagentStop: LAST RESORT fallback to first handoff, type={subagent_type}")
 
     # Extract the subagent's result from its transcript
     subagent_result = None
+    subagent_tool_use_ids = []
     if agent_transcript_path and os.path.exists(agent_transcript_path):
         subagent_result = _extract_subagent_result(agent_transcript_path)
+        # CRITICAL: Extract ALL tool_use_ids from the subagent transcript
+        # This is the AUTHORITATIVE source for tool call attribution
+        subagent_tool_use_ids = _extract_tool_use_ids_from_transcript(agent_transcript_path)
         _log_error(f"SubagentStop: extracted result length={len(subagent_result) if subagent_result else 0} from {agent_transcript_path}")
+        _log_error(f"SubagentStop: extracted {len(subagent_tool_use_ids)} tool_use_ids: {subagent_tool_use_ids}")
+
+        # FALLBACK: If subagent_type is still generic, try to extract from transcript
+        if subagent_type == "Subagent":
+            extracted_type = _extract_agent_type_from_transcript(agent_transcript_path)
+            if extracted_type:
+                subagent_type = extracted_type
+                _log_error(f"SubagentStop: extracted agent_type from transcript: {subagent_type}")
     
     # Store both the transcript path AND the extracted result for _handle_task_complete
     # This is critical because PostToolUse for Task doesn't include tool_output
@@ -927,6 +1057,29 @@ def handle_subagent_stop(input_data: dict) -> None:
         else:
             result_preview = subagent_result
     
+    # CRITICAL: Emit tool.call.attribute events for EACH tool call this subagent made
+    # This corrects the initial attribution from PreToolUse (which used LAST RESORT fallback)
+    # The frontend should use these events to re-attribute tool calls to the correct subagent lane
+    if subagent_tool_use_ids and matched_tool_use_id:
+        handoff_key = generate_handoff_key(session_id, matched_tool_use_id)
+        _log_error(f"SubagentStop: emitting tool.call.attribute for {len(subagent_tool_use_ids)} tools -> {full_agent_id}")
+        for tool_uid in subagent_tool_use_ids:
+            emit_with_seq_sync(session_id, run, normalize_event(
+                run,
+                event_type="tool.call.attribute",
+                agent_id=full_agent_id,
+                agent_role=subagent_type if agent_id else "main",
+                summary=f"Tool {tool_uid} belongs to {subagent_type}",
+                attrs={
+                    "tool_use_id": tool_uid,
+                    "subagent_id": agent_id,
+                    "subagent_type": subagent_type,
+                    "task_tool_use_id": matched_tool_use_id,
+                    "handoff_key": handoff_key,
+                },
+                payload={},
+            ))
+
     emit_with_seq_sync(session_id, run, normalize_event(
         run,
         event_type="agent.end",
@@ -938,14 +1091,106 @@ def handle_subagent_stop(input_data: dict) -> None:
             "subagent_type": subagent_type,
             "result_truncated": result_truncated,
             "result_full_length": len(subagent_result) if subagent_result else 0,
+            # CRITICAL: Include the matched Task tool_use_id for parent correlation
+            "task_tool_use_id": matched_tool_use_id,
         },
         payload={
             "agent_transcript_path": agent_transcript_path,
             "result_preview": result_preview,
+            # AUTHORITATIVE: List of ALL tool_use_ids made by this subagent
+            # Frontend can use this to definitively attribute tool calls to subagent lanes
+            "tool_use_ids": subagent_tool_use_ids,
         },
     ))
-    
+
     _flush_run(run, session_id)
+
+
+def handle_subagent_start(input_data: dict) -> None:
+    """Handle SubagentStart hook - subagent begins execution.
+
+    Added in Claude Code v2.0.43. This hook fires when a subagent starts executing.
+
+    CRITICAL: SubagentStart provides agent_id and agent_type, but NOT tool_use_id.
+    We use TIMING CORRELATION to match this subagent to its parent Task:
+    1. PreToolUse[Task] fires first -> creates handoff with tool_use_id + subagent_type
+    2. SubagentStart fires shortly after -> provides agent_id + agent_type
+
+    RACE CONDITION FIX: When multiple same-type subagents run in parallel, FIFO matching
+    is unreliable because hook delivery order is not guaranteed. In this case:
+    - Mark the agent as "pending_prompt_match"
+    - Defer definitive mapping to SubagentStop where we have the subagent's transcript
+    - SubagentStop will use compute_prompt_similarity() to match tool events to Task prompts
+
+    For single subagents of a type, FIFO matching is used (reliable when unambiguous).
+    """
+    session_id = input_data["session_id"]
+
+    # SubagentStart provides: agent_id, agent_type (NOT tool_use_id or subagent_type!)
+    agent_id = input_data.get("agent_id")
+    agent_type = input_data.get("agent_type")  # This is what Claude Code sends
+
+    _log_error(f"SubagentStart: agent_id={agent_id}, agent_type={agent_type}")
+
+    if not agent_id or not agent_type:
+        _log_error(f"SubagentStart: missing agent_id or agent_type, cannot build mapping")
+        return
+
+    turn_info = get_current_turn(session_id)
+    if not turn_info:
+        _log_error(f"SubagentStart: no turn_info for session {session_id}")
+        return
+
+    # TIMING CORRELATION: Match to unassigned Task handoff of matching type
+    # active_subagents tracks Tasks that haven't been assigned an agent_id yet
+    active_subagents = turn_info.get("active_subagents", {})
+    agent_to_task_mapping = turn_info.get("agent_to_task_mapping", {})
+    pending_prompt_matches = turn_info.get("pending_prompt_matches", {})
+
+    # Count unassigned Tasks of matching type to detect ambiguous case
+    unassigned_same_type = []
+    for tool_use_id, info in active_subagents.items():
+        subagent_type = info.get("type", "")
+        already_assigned = info.get("assigned_agent_id")
+        if subagent_type == agent_type and not already_assigned:
+            unassigned_same_type.append(tool_use_id)
+
+    _log_error(f"SubagentStart: found {len(unassigned_same_type)} unassigned Tasks of type={agent_type}: {unassigned_same_type}")
+
+    matched_tool_use_id = None
+
+    # SINGLE SUBAGENT of this type: Use FIFO matching (reliable when unambiguous)
+    if len(unassigned_same_type) == 1:
+        matched_tool_use_id = unassigned_same_type[0]
+        info = active_subagents[matched_tool_use_id]
+        info["assigned_agent_id"] = agent_id
+        _log_error(f"SubagentStart: FIFO MATCHED (single) agent_id={agent_id} to tool_use_id={matched_tool_use_id}")
+
+        # Store the mapping: agent_id -> task_tool_use_id
+        agent_to_task_mapping[agent_id] = matched_tool_use_id
+        update_turn_state(session_id, {
+            "active_subagents": active_subagents,
+            "agent_to_task_mapping": agent_to_task_mapping,
+        })
+        _log_error(f"SubagentStart: stored FIFO mapping agent_id={agent_id} -> tool_use_id={matched_tool_use_id}")
+
+    # MULTIPLE SUBAGENTS of same type: Defer to SubagentStop for prompt matching
+    elif len(unassigned_same_type) > 1:
+        _log_error(f"SubagentStart: AMBIGUOUS - {len(unassigned_same_type)} same-type Tasks, deferring to prompt match")
+
+        # Mark this agent as pending prompt match - SubagentStop will resolve it
+        pending_prompt_matches[agent_id] = {
+            "agent_type": agent_type,
+            "candidate_tool_use_ids": unassigned_same_type,
+            "started_at": _now_iso(),
+        }
+        update_turn_state(session_id, {
+            "pending_prompt_matches": pending_prompt_matches,
+        })
+        _log_error(f"SubagentStart: marked agent_id={agent_id} as pending_prompt_match, candidates={unassigned_same_type}")
+
+    else:
+        _log_error(f"SubagentStart: NO MATCH found for agent_type={agent_type}, active_subagents={list(active_subagents.keys())}")
 
 
 def handle_pre_compact(input_data: dict) -> None:
@@ -1105,6 +1350,115 @@ def _extract_subagent_result(transcript_path: str) -> Optional[str]:
         _log_error(f"Failed to extract subagent result from {transcript_path}: {e}")
     
     return last_assistant_text
+
+
+def _extract_tool_use_ids_from_transcript(transcript_path: str) -> list[str]:
+    """
+    Extract all tool_use_ids from a subagent transcript.
+
+    This is the AUTHORITATIVE source for which tool calls a subagent made.
+    The subagent transcript contains all tool_use entries with their ids.
+
+    Args:
+        transcript_path: Path to the subagent's JSONL transcript file
+
+    Returns:
+        List of tool_use_ids found in the transcript
+    """
+    if not transcript_path or not os.path.exists(transcript_path):
+        return []
+
+    tool_use_ids = []
+
+    try:
+        with open(transcript_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                # Look for tool_use in message content
+                message = msg.get("message", {})
+                content = message.get("content", [])
+
+                if not isinstance(content, list):
+                    continue
+
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "tool_use":
+                        tool_id = item.get("id")
+                        if tool_id and tool_id not in tool_use_ids:
+                            tool_use_ids.append(tool_id)
+
+    except Exception as e:
+        _log_error(f"Failed to extract tool_use_ids from {transcript_path}: {e}")
+
+    return tool_use_ids
+
+
+def _extract_agent_type_from_transcript(transcript_path: str) -> Optional[str]:
+    """
+    Extract the agent type from a subagent's transcript.
+
+    Looks for subagent_type field or parses the prompt to determine type.
+
+    Args:
+        transcript_path: Path to the subagent's JSONL transcript file
+
+    Returns:
+        The agent type (e.g., "search-specialist", "research-analyst"), or None
+    """
+    if not transcript_path or not os.path.exists(transcript_path):
+        return None
+
+    try:
+        with open(transcript_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                # Look for subagent_type or agent_type fields directly
+                for field in ["subagent_type", "agent_type", "agentType"]:
+                    if field in msg:
+                        return msg[field]
+
+                # Check in nested message
+                message = msg.get("message", {})
+                for field in ["subagent_type", "agent_type"]:
+                    if field in message:
+                        return message[field]
+
+                # Look for first user message content that might contain type info
+                # The Task prompt usually contains the subagent_type
+                if msg.get("type") == "user":
+                    content = msg.get("content", "") or msg.get("message", {}).get("content", "")
+                    if isinstance(content, str) and content.strip():
+                        # First line of user message might be the agent role description
+                        first_line = content.split('\n')[0].lower()
+                        # Common agent types
+                        agent_types = [
+                            "search-specialist", "research-analyst", "market-researcher",
+                            "code-reviewer", "security-auditor", "debugger", "Explore",
+                            "frontend-developer", "backend-developer", "fullstack-developer",
+                        ]
+                        for at in agent_types:
+                            if at.lower() in first_line:
+                                return at
+                    break  # Only check first user message
+
+    except Exception as e:
+        _log_error(f"Failed to extract agent type from {transcript_path}: {e}")
+
+    return None
 
 
 def _extract_first_user_message(transcript_path: str) -> Optional[str]:
@@ -1282,57 +1636,255 @@ def _extract_tool_result_from_transcript(
     return None
 
 
-def _get_current_agent_id(session_id: str, turn_info: Optional[dict] = None) -> str:
+def _get_current_agent_id(
+    session_id: str,
+    turn_info: Optional[dict] = None,
+    tool_input: Optional[dict] = None,
+) -> str:
     """Get the current agent ID based on span context.
 
     If we're inside a subagent delegation (Task span), return the subagent's ID.
-    For parallel subagents, we use current_executing_subagent to identify the correct one.
+    For parallel subagents, we use content-based matching to identify the correct one.
+
+    Args:
+        session_id: Claude Code session ID
+        turn_info: Current turn state
+        tool_input: Tool input dict (used for content-based matching with parallel subagents)
     """
     if turn_info:
         spans = turn_info.get("spans", [])
+        subagent_spans = [s for s in spans if s.get("subagent_type")]
 
-        # PRIORITY 1: Use current_executing_subagent for parallel subagent scenarios
-        # This is set in UserPromptSubmit when a subagent starts executing
+        if not subagent_spans:
+            return f"claude_code:main:{session_id}"
+
+        # SINGLE SUBAGENT: Just use it
+        if len(subagent_spans) == 1:
+            span = subagent_spans[0]
+            return f"claude_code:subagent:{span['subagent_type']}:{span['tool_use_id']}"
+
+        # MULTIPLE SUBAGENTS: Try content-based matching
+        if tool_input and len(subagent_spans) > 1:
+            matched_span = _match_tool_to_subagent(tool_input, turn_info)
+            if matched_span:
+                return f"claude_code:subagent:{matched_span['subagent_type']}:{matched_span['tool_use_id']}"
+
+        # FALLBACK: Use current_executing_subagent if set
         current_executing = turn_info.get("current_executing_subagent")
         if current_executing:
-            for span in spans:
-                if span.get("tool_use_id") == current_executing and span.get("subagent_type"):
+            for span in subagent_spans:
+                if span.get("tool_use_id") == current_executing:
                     return f"claude_code:subagent:{span['subagent_type']}:{span['tool_use_id']}"
 
-        # PRIORITY 2: Fall back to most recent subagent span (for single subagent case)
-        for span in reversed(spans):
-            if span.get("subagent_type"):
-                return f"claude_code:subagent:{span['subagent_type']}:{span['tool_use_id']}"
+        # LAST RESORT: Use most recent subagent span
+        span = subagent_spans[-1]
+        return f"claude_code:subagent:{span['subagent_type']}:{span['tool_use_id']}"
 
     return f"claude_code:main:{session_id}"
 
 
-def _get_current_agent_role(turn_info: Optional[dict] = None) -> str:
+def _match_tool_to_subagent(tool_input: dict, turn_info: dict) -> Optional[dict]:
+    """Match a tool call to the most relevant subagent based on content.
+
+    Uses keyword matching between the tool input and subagent prompts to
+    determine which subagent most likely made this tool call.
+
+    Args:
+        tool_input: The tool's input parameters
+        turn_info: Current turn state containing active_subagents and spans
+
+    Returns:
+        The matched span dict, or None if no good match found
+    """
+    active_subagents = turn_info.get("active_subagents", {})
+    spans = turn_info.get("spans", [])
+
+    if not active_subagents or not spans:
+        return None
+
+    # Build a string from tool_input for matching
+    tool_text = _extract_text_from_tool_input(tool_input).lower()
+    if not tool_text:
+        return None
+
+    best_match = None
+    best_score = 0
+
+    for tool_use_id, info in active_subagents.items():
+        prompt = info.get("prompt", "").lower()
+        if not prompt:
+            continue
+
+        # Calculate match score based on keyword overlap
+        score = _calculate_match_score(tool_text, prompt)
+
+        if score > best_score:
+            best_score = score
+            # Find the corresponding span
+            for span in spans:
+                if span.get("tool_use_id") == tool_use_id:
+                    best_match = span
+                    break
+
+    # Only return match if score is above threshold (avoid false positives)
+    if best_score >= 2:  # At least 2 keyword matches
+        _log_error(f"_match_tool_to_subagent: matched with score={best_score}, tool_use_id={best_match.get('tool_use_id') if best_match else None}")
+        return best_match
+
+    return None
+
+
+def _extract_text_from_tool_input(tool_input: dict) -> str:
+    """Extract searchable text from tool input."""
+    texts = []
+    for _, value in tool_input.items():
+        if isinstance(value, str):
+            texts.append(value)
+        elif isinstance(value, dict):
+            texts.append(_extract_text_from_tool_input(value))
+    return " ".join(texts)
+
+
+def _calculate_match_score(tool_text: str, prompt: str) -> int:
+    """Calculate how well tool_text matches a subagent prompt.
+
+    Uses keyword matching for common AWS/security terms.
+    """
+    # Common keywords that indicate specific subagent domains
+    keyword_groups = [
+        # IAM related
+        ["iam", "user", "role", "policy", "permission", "access key", "mfa"],
+        # S3 related
+        ["s3", "bucket", "object", "storage", "versioning"],
+        # Database related
+        ["rds", "database", "aurora", "dynamodb", "mysql", "postgres"],
+        # Network related
+        ["vpc", "subnet", "security group", "nacl", "route", "gateway", "elb", "alb"],
+        # Logging/monitoring related
+        ["cloudtrail", "cloudwatch", "guardduty", "log", "alarm", "metric", "config"],
+        # Lambda/API related
+        ["lambda", "api gateway", "function", "serverless"],
+        # KMS/Secrets related
+        ["kms", "key", "encrypt", "secret", "credential"],
+    ]
+
+    score = 0
+    for keywords in keyword_groups:
+        # Check if any keyword from this group appears in BOTH tool_text and prompt
+        tool_matches = any(kw in tool_text for kw in keywords)
+        prompt_matches = any(kw in prompt for kw in keywords)
+        if tool_matches and prompt_matches:
+            score += 1
+
+    return score
+
+
+def compute_prompt_similarity(prompt1: str, prompt2: str) -> float:
+    """Compute similarity between two prompts using keyword extraction and Jaccard similarity.
+
+    This is used to match subagent tool events to their parent Task prompts when
+    multiple same-type subagents are running in parallel (FIFO matching is ambiguous).
+
+    Args:
+        prompt1: First prompt text
+        prompt2: Second prompt text
+
+    Returns:
+        Similarity score between 0.0 and 1.0 (Jaccard similarity of extracted keywords)
+    """
+    import re
+
+    if not prompt1 or not prompt2:
+        return 0.0
+
+    def extract_keywords(text: str) -> set:
+        """Extract significant keywords from text.
+
+        Filters out common stop words and short words, keeping nouns/phrases
+        that are likely to be distinctive.
+        """
+        # Common stop words to filter out
+        stop_words = {
+            "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
+            "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
+            "being", "have", "has", "had", "do", "does", "did", "will", "would",
+            "could", "should", "may", "might", "must", "shall", "can", "need",
+            "this", "that", "these", "those", "it", "its", "they", "them", "their",
+            "we", "us", "our", "you", "your", "i", "me", "my", "he", "she", "his",
+            "her", "what", "which", "who", "whom", "when", "where", "why", "how",
+            "all", "each", "every", "both", "few", "more", "most", "other", "some",
+            "such", "no", "nor", "not", "only", "same", "so", "than", "too", "very",
+            "just", "also", "now", "here", "there", "then", "once", "if", "else",
+            "use", "using", "used", "make", "makes", "made", "get", "gets", "got",
+            "any", "about", "into", "over", "after", "before", "between", "under",
+            "again", "further", "then", "once", "during", "while", "through",
+        }
+
+        # Normalize text: lowercase and extract words
+        text_lower = text.lower()
+        # Extract words (alphanumeric sequences)
+        words = re.findall(r'\b[a-z][a-z0-9_-]*\b', text_lower)
+
+        # Filter: keep words that are not stop words and have length >= 3
+        keywords = {w for w in words if w not in stop_words and len(w) >= 3}
+
+        return keywords
+
+    keywords1 = extract_keywords(prompt1)
+    keywords2 = extract_keywords(prompt2)
+
+    if not keywords1 or not keywords2:
+        return 0.0
+
+    # Jaccard similarity: |intersection| / |union|
+    intersection = keywords1 & keywords2
+    union = keywords1 | keywords2
+
+    similarity = len(intersection) / len(union) if union else 0.0
+
+    return similarity
+
+
+def _get_current_agent_role(
+    turn_info: Optional[dict] = None,
+    tool_input: Optional[dict] = None,
+) -> str:
     """Get the current agent role based on span context.
 
     If we're inside a subagent delegation, return that subagent's role.
-    For parallel subagents, we use current_executing_subagent to identify the correct one.
+    For parallel subagents, we use content-based matching to identify the correct one.
     """
     if turn_info:
         spans = turn_info.get("spans", [])
+        subagent_spans = [s for s in spans if s.get("subagent_type")]
 
-        # PRIORITY 1: Use current_executing_subagent for parallel subagent scenarios
+        if not subagent_spans:
+            return "main"
+
+        # SINGLE SUBAGENT: Just use it
+        if len(subagent_spans) == 1:
+            return subagent_spans[0]["subagent_type"]
+
+        # MULTIPLE SUBAGENTS: Try content-based matching
+        if tool_input and len(subagent_spans) > 1:
+            matched_span = _match_tool_to_subagent(tool_input, turn_info)
+            if matched_span:
+                return matched_span["subagent_type"]
+
+        # FALLBACK: Use current_executing_subagent if set
         current_executing = turn_info.get("current_executing_subagent")
         if current_executing:
-            for span in spans:
-                if span.get("tool_use_id") == current_executing and span.get("subagent_type"):
+            for span in subagent_spans:
+                if span.get("tool_use_id") == current_executing:
                     return span["subagent_type"]
 
-        # PRIORITY 2: Fall back to most recent subagent span (for single subagent case)
-        for span in reversed(spans):
-            subagent_type = span.get("subagent_type")
-            if subagent_type:
-                return subagent_type
+        # LAST RESORT: Use most recent subagent span
+        return subagent_spans[-1]["subagent_type"]
 
     return "main"
 
 
-def _flush_run(run: Any, session_id: str = None) -> None:
+def _flush_run(run: Any, _session_id: str = None) -> None:
     """Flush the run's sink.
     
     NOTE: We do NOT persist turn state here anymore!

@@ -81,9 +81,9 @@ class AgentContext:
         if not instance_id:
             instance_id = _generate_instance_id()
             agent_info["instance_id"] = instance_id
-            # Update the full ID to be instance-aware
+            # Update ID to be role-based for visualization swimlane consolidation
             role = agent_info.get("role", "unknown")
-            agent_info["id"] = f"crewai:role:{role}:instance_{instance_id}"
+            agent_info["id"] = f"crewai:role:{role}"
 
         # Get the current agent (if any) to set as parent
         current_agent = self.get_current_agent()

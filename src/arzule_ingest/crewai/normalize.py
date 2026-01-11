@@ -8,8 +8,11 @@ import uuid
 from typing import TYPE_CHECKING, Any, Optional
 
 from ..ids import new_span_id
+from ..logger import get_logger
 from ..sanitize import sanitize, truncate_string
 from .handoff import is_delegation_tool
+
+logger = get_logger()
 
 if TYPE_CHECKING:
     from ..run import ArzuleRun
@@ -102,13 +105,14 @@ def _extract_agent_info(
 
     role = _safe_getattr(agent, "role", None) or _safe_getattr(agent, "name", "unknown")
 
-    # Generate instance-aware ID: crewai:role:{role}:instance_{unique_id}
-    # This ensures each agent instance gets a unique identifier even if
-    # multiple instances of the same agent type (role) are created.
+    # Generate stable agent ID by role: crewai:role:{role}
+    # This ensures all events for the same agent role consolidate into one
+    # visualization swimlane. The instance_id is stored separately for tracking
+    # individual agent executions when needed.
     agent_instance_id = instance_id or _generate_instance_id()
 
     info: dict[str, Any] = {
-        "id": f"crewai:role:{role}:instance_{agent_instance_id}",
+        "id": f"crewai:role:{role}",
         "role": role,
         "instance_id": agent_instance_id,
     }
@@ -583,16 +587,16 @@ def evt_from_crewai_event(
         instance_id=agent_instance_id,
     )
 
-    # Fallback: check for agent_role/agent_id directly on event (e.g., LLM events)
-    # CrewAI's LLM events set agent_role/agent_id directly from from_agent, not as nested object
+    # Fallback: check for agent_role directly on event (e.g., LLM events)
+    # CrewAI's LLM events set agent_role directly from from_agent, not as nested object
+    # NOTE: We intentionally ignore event.agent_id as it may be a UUID - always use role-based ID
     if not agent_info:
         agent_role = _safe_getattr(event, "agent_role", None)
         if agent_role:
-            agent_id = _safe_getattr(event, "agent_id", None)
-            # Generate instance-aware ID for fallback agent info
+            # Always generate role-based ID for visualization swimlane consolidation
             fallback_instance_id = agent_instance_id or _generate_instance_id()
             agent_info = {
-                "id": agent_id or f"crewai:role:{agent_role}:instance_{fallback_instance_id}",
+                "id": f"crewai:role:{agent_role}",
                 "role": agent_role,
                 "instance_id": fallback_instance_id,
             }
@@ -822,11 +826,15 @@ def evt_from_crewai_event(
         token_usage = _extract_token_usage(response)
         if token_usage:
             attrs.update(token_usage)
-    
+            logger.debug(f"[arzule] Token usage from response: {token_usage}")
+        else:
+            logger.debug(f"[arzule] No token usage in response. Response type: {type(response).__name__}, has usage: {hasattr(response, 'usage')}")
+
     # Use passed-in token usage from LLM source if available (preferred)
     # This comes from CrewAI's internal _token_usage tracking
     if llm_token_usage:
         attrs.update(llm_token_usage)
+        logger.debug(f"[arzule] Token usage from LLM source: {llm_token_usage}")
 
     # LLM model info
     model = _safe_getattr(event, "model", None)

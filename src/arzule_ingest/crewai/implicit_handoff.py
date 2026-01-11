@@ -64,19 +64,19 @@ def _get_agent_instance_id(task: Any) -> Optional[str]:
 
 
 def _build_agent_id(role: str, instance_id: Optional[str] = None) -> str:
-    """Build agent ID using instance-aware format when available.
+    """Build agent ID using role-based format for visualization swimlane consolidation.
+
+    Always returns crewai:role:{role} regardless of instance_id.
+    The instance_id parameter is kept for API compatibility but ignored -
+    instance tracking is done via the separate instance_id field in agent_info.
 
     Args:
         role: The agent role.
-        instance_id: Optional instance ID for uniqueness.
+        instance_id: Ignored (kept for API compatibility).
 
     Returns:
-        Agent ID in format:
-        - "crewai:role:{role}:instance_{instance_id}" when instance_id is provided
-        - "crewai:role:{role}" as fallback for backward compatibility
+        Agent ID in format crewai:role:{role}
     """
-    if instance_id:
-        return f"crewai:role:{role}:instance_{instance_id}"
     return f"crewai:role:{role}"
 
 # =============================================================================

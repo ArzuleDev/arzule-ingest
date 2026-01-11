@@ -45,7 +45,12 @@ def _build_hook_config() -> dict:
         "PostToolUse": [
             {"matcher": ".*", "hooks": [{"type": "command", "command": command}]}
         ],
+        "SubagentStart": [
+            # CRITICAL: Captures subagent start for agent_id mapping (v2.0.43+)
+            {"hooks": [{"type": "command", "command": command}]}
+        ],
         "SubagentStop": [
+            # CRITICAL: Captures agent_id and agent_transcript_path for definitive attribution
             {"hooks": [{"type": "command", "command": command}]}
         ],
         "Stop": [
