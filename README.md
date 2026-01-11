@@ -10,9 +10,29 @@ Lightweight SDK for capturing multi-agent traces and sending them to Arzule.
 
 ## Installation
 
+The SDK has a lightweight core with optional framework integrations. Install only what you need:
+
 ```bash
+# Create a virtual environment (recommended)
+python3 -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# Core only (httpx, pydantic, cryptography)
 pip install arzule-ingest
+
+# With specific framework support
+pip install arzule-ingest[crewai]      # CrewAI integration
+pip install arzule-ingest[langchain]   # LangChain/LangGraph integration
+pip install arzule-ingest[autogen]     # AutoGen v0.2 integration
+
+# Multiple frameworks
+pip install arzule-ingest[crewai,langchain]
+
+# All framework integrations
+pip install arzule-ingest[all]
 ```
+
+> **Note:** Framework integrations require Python versions supported by each framework. For example, CrewAI currently requires Python <3.14. The core SDK works on Python 3.10+.
 
 ## Quick Start
 

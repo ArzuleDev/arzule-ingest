@@ -12,7 +12,7 @@ from .run import ArzuleRun, current_run
 from .config import ArzuleConfig
 from .audit import AuditLogger, audit_log
 
-__version__ = "0.8.0"
+__version__ = "0.8.2"
 __all__ = [
     "ArzuleRun",
     "current_run",
