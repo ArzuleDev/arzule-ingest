@@ -5,10 +5,24 @@ from __future__ import annotations
 import json
 import threading
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
 from .base import TelemetrySink
+
+
+def _log_to_hook_debug(message: str) -> None:
+    """Log to hook debug file (for Claude Code hooks where stderr isn't visible)."""
+    try:
+        log_file = Path.home() / ".arzule" / "hook_debug.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).isoformat()
+        with open(log_file, "a") as f:
+            f.write(f"[{ts}] {message}\n")
+    except Exception:
+        pass
 
 
 class TLSRequiredError(ValueError):
@@ -207,8 +221,18 @@ class HttpBatchSink(TelemetrySink):
                 file=sys.stderr,
             )
             
+            # Also log to hook debug log file for Claude Code hooks (stderr not visible)
+            _log_to_hook_debug(
+                f"HttpBatchSink FAILED: {error_type}{status_info}{server_error}, "
+                f"batch_size={len(batch)}, events={[evt.get('event_type') for evt in batch]}"
+            )
+            
             # For 4xx errors (except retryable ones), clear buffer to prevent infinite loops
             if status_code and 400 <= status_code < 500 and status_code not in (401, 403, 429):
+                _log_to_hook_debug(
+                    f"HttpBatchSink CLEARING buffer due to {status_code} error, "
+                    f"dropped events: {[(evt.get('event_type'), evt.get('span_id', '')[:12]) for evt in self._buffer]}"
+                )
                 self._buffer.clear()
 
     def clear_buffer(self) -> int:

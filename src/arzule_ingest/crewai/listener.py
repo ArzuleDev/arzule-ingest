@@ -249,10 +249,26 @@ class ArzuleCrewAIListener:
 
             @bus.on(LLMCallCompletedEvent)
             def on_llm_complete(source: Any, event: LLMCallCompletedEvent) -> None:
-                # Extract token usage delta from the LLM source instance
+                logger = get_logger()
+                # Try to extract token usage from multiple sources
+                token_delta = None
+
+                # 1. Try from LLM source instance's _token_usage (cumulative tracking)
                 token_delta = self._extract_llm_token_delta(source)
+
+                # 2. Fallback: try to extract from event.response if it has usage data
+                if not token_delta:
+                    response = getattr(event, "response", None)
+                    if response:
+                        token_delta = self._extract_token_from_response(response)
+                        if token_delta:
+                            logger.debug(f"[arzule] Token usage extracted from event.response: {token_delta}")
+
                 if token_delta:
                     logger.info(f"[arzule] LLM call used {token_delta.get('total_tokens', 0)} tokens (prompt: {token_delta.get('prompt_tokens', 0)}, completion: {token_delta.get('completion_tokens', 0)})")
+                else:
+                    logger.debug("[arzule] No token usage found from source or response")
+
                 self._handle_event(event, llm_token_usage=token_delta)
 
             @bus.on(LLMCallFailedEvent)
@@ -487,24 +503,30 @@ class ArzuleCrewAIListener:
 
     def _extract_llm_token_delta(self, llm_source: Any) -> Optional[dict[str, int]]:
         """Extract token usage delta from an LLM instance.
-        
+
         CrewAI's LLM instances track cumulative token usage in _token_usage.
         This method computes the delta since the last call by tracking
         the previous values per LLM instance.
-        
+
         Args:
             llm_source: The LLM instance that emitted the event
-            
+
         Returns:
             Dict with prompt_tokens, completion_tokens, total_tokens delta,
             or None if token usage is not available.
         """
+        logger = get_logger()
         if llm_source is None:
+            logger.debug("[arzule] LLM token extraction: source is None")
             return None
-            
+
+        # Debug: log what llm_source actually is
+        logger.debug(f"[arzule] LLM token extraction: source type={type(llm_source).__name__}, has _token_usage={hasattr(llm_source, '_token_usage')}")
+
         # Try to access the internal _token_usage dict
         token_usage = getattr(llm_source, "_token_usage", None)
         if not token_usage or not isinstance(token_usage, dict):
+            logger.debug(f"[arzule] LLM token extraction: _token_usage not found or not dict (value={token_usage})")
             return None
             
         llm_id = id(llm_source)
@@ -535,6 +557,67 @@ class ArzuleCrewAIListener:
         if delta["total_tokens"] > 0 or delta["prompt_tokens"] > 0 or delta["completion_tokens"] > 0:
             return delta
         return None
+
+    def _extract_token_from_response(self, response: Any) -> Optional[dict[str, int]]:
+        """Extract token usage from LLM response object.
+
+        Supports multiple formats from different LLM providers:
+        - OpenAI/LiteLLM: response.usage.{prompt_tokens, completion_tokens, total_tokens}
+        - usage_metadata: response.usage_metadata.{input_tokens, output_tokens}
+        - Dict format: response["usage"]
+
+        Args:
+            response: The LLM response object
+
+        Returns:
+            Dict with prompt_tokens, completion_tokens, total_tokens, or None
+        """
+        if response is None:
+            return None
+
+        result: dict[str, int] = {}
+
+        # Try response.usage (OpenAI/LiteLLM format)
+        usage = getattr(response, "usage", None)
+        if usage:
+            prompt = getattr(usage, "prompt_tokens", None) or getattr(usage, "input_tokens", None)
+            completion = getattr(usage, "completion_tokens", None) or getattr(usage, "output_tokens", None)
+            total = getattr(usage, "total_tokens", None)
+
+            if prompt is not None:
+                result["prompt_tokens"] = int(prompt)
+            if completion is not None:
+                result["completion_tokens"] = int(completion)
+            if total is not None:
+                result["total_tokens"] = int(total)
+            elif prompt is not None and completion is not None:
+                result["total_tokens"] = int(prompt) + int(completion)
+
+        # Try response.usage_metadata (Anthropic/LangChain format)
+        if not result:
+            usage_meta = getattr(response, "usage_metadata", None)
+            if usage_meta:
+                input_tokens = getattr(usage_meta, "input_tokens", None)
+                output_tokens = getattr(usage_meta, "output_tokens", None)
+                if input_tokens is not None:
+                    result["prompt_tokens"] = int(input_tokens)
+                if output_tokens is not None:
+                    result["completion_tokens"] = int(output_tokens)
+                if input_tokens is not None and output_tokens is not None:
+                    result["total_tokens"] = int(input_tokens) + int(output_tokens)
+
+        # Try dict-style access
+        if not result and isinstance(response, dict):
+            usage = response.get("usage", {})
+            if usage:
+                if "prompt_tokens" in usage:
+                    result["prompt_tokens"] = int(usage["prompt_tokens"])
+                if "completion_tokens" in usage:
+                    result["completion_tokens"] = int(usage["completion_tokens"])
+                if "total_tokens" in usage:
+                    result["total_tokens"] = int(usage["total_tokens"])
+
+        return result if result else None
 
     def _handle_event(self, event: Any, llm_token_usage: Optional[dict[str, int]] = None) -> None:
         """Convert and emit a CrewAI event as a trace event.

@@ -42,19 +42,70 @@ def _compute_payload_hash(payload: Any) -> Optional[str]:
 def _extract_payload_keys(payload: Any, max_keys: int = 15) -> list[str]:
     """
     Extract top-level keys from handoff payload for schema analysis.
-    
+
     Returns sorted list of keys (capped at max_keys) for detecting
     contract drift across handoffs between the same agent pairs.
     """
     if not isinstance(payload, dict):
         return []
-    
+
     try:
         # Get sorted keys, excluding internal arzule metadata
         keys = [k for k in payload.keys() if k != "arzule"]
         return sorted(keys)[:max_keys]
     except Exception:
         return []
+
+
+def _build_agent_id(role: str, instance_id: Optional[str] = None) -> str:
+    """
+    Build an agent ID using role-based format for visualization swimlane consolidation.
+
+    Always returns crewai:role:{role} regardless of instance_id.
+    The instance_id parameter is kept for API compatibility but ignored -
+    instance tracking is done via the separate instance_id field in agent_info.
+
+    Args:
+        role: The agent's role name
+        instance_id: Ignored (kept for API compatibility)
+
+    Returns:
+        Agent ID string in format crewai:role:{role}
+    """
+    return f"crewai:role:{role}"
+
+
+def _get_agent_id_from_context(run: "ArzuleRun", agent: Any) -> Optional[str]:
+    """
+    Get the agent ID using the run's agent context for instance-aware tracking.
+
+    This ensures handoff events use the same instance-aware agent IDs as
+    normalize.py for proper forensics correlation.
+
+    Args:
+        run: The active ArzuleRun with agent context
+        agent: The CrewAI agent object
+
+    Returns:
+        Instance-aware agent ID or None if no agent
+    """
+    if not agent:
+        return None
+
+    role = getattr(agent, "role", None) or "unknown"
+
+    # Try to get instance_id from the run's agent context
+    # This is set when the agent started execution
+    current_agent = run.get_current_agent()
+    if current_agent:
+        current_role = current_agent.get("role")
+        # If the current agent matches this agent, use its instance_id
+        if current_role == role:
+            instance_id = current_agent.get("instance_id")
+            return _build_agent_id(role, instance_id)
+
+    # Fall back to old format if no instance_id available
+    return _build_agent_id(role)
 
 # Pattern to extract handoff keys from task descriptions
 HANDOFF_RE = re.compile(r"\[arzule_handoff:([0-9a-f-]{36})\]")
@@ -180,7 +231,7 @@ def maybe_inject_handoff_key(run: "ArzuleRun", context: Any) -> Optional[str]:
     agent = getattr(context, "agent", None)
     run._handoff_pending[handoff_key] = {
         "from_role": getattr(agent, "role", None) if agent else None,
-        "from_agent_id": f"crewai:role:{getattr(agent, 'role', 'unknown')}" if agent else None,
+        "from_agent_id": _get_agent_id_from_context(run, agent),
         "tool_name": tool_name,
         "proposed_at": run.now(),
         "tool_input": tool_input.copy() if tool_input else {},  # Store for drift detection
@@ -230,6 +281,15 @@ def maybe_emit_handoff_proposed(run: "ArzuleRun", context: Any, span_id: Optiona
     if payload_keys:
         attrs["payload_keys"] = payload_keys
 
+    # Build agent info with instance-aware ID
+    agent_info = None
+    if agent:
+        agent_role = getattr(agent, "role", None)
+        agent_info = {
+            "id": _get_agent_id_from_context(run, agent),
+            "role": agent_role,
+        }
+
     run.emit({
         "schema_version": "trace_event.v0_1",
         "run_id": run.run_id,
@@ -240,10 +300,7 @@ def maybe_emit_handoff_proposed(run: "ArzuleRun", context: Any, span_id: Optiona
         "parent_span_id": run.current_parent_span_id(),
         "seq": run.next_seq(),
         "ts": run.now(),
-        "agent": {
-            "id": f"crewai:role:{getattr(agent, 'role', 'unknown')}" if agent else None,
-            "role": getattr(agent, "role", None) if agent else None,
-        } if agent else None,
+        "agent": agent_info,
         "event_type": "handoff.proposed",
         "status": "ok",
         "summary": f"handoff proposed to {to_coworker or 'coworker'}",
@@ -288,6 +345,19 @@ def emit_handoff_ack(
     """
     pending = run._handoff_pending.get(handoff_key, {})
 
+    # Build agent info with instance-aware ID
+    # Try to get instance_id from run's agent context for the receiving agent
+    agent_info = None
+    if agent_role:
+        current_agent = run.get_current_agent()
+        instance_id = None
+        if current_agent and current_agent.get("role") == agent_role:
+            instance_id = current_agent.get("instance_id")
+        agent_info = {
+            "id": _build_agent_id(agent_role, instance_id),
+            "role": agent_role,
+        }
+
     run.emit({
         "schema_version": "trace_event.v0_1",
         "run_id": run.run_id,
@@ -298,10 +368,7 @@ def emit_handoff_ack(
         "parent_span_id": run.current_parent_span_id(),
         "seq": run.next_seq(),
         "ts": run.now(),
-        "agent": {
-            "id": f"crewai:role:{agent_role}" if agent_role else None,
-            "role": agent_role,
-        } if agent_role else None,
+        "agent": agent_info,
         "task_id": task_id,
         "event_type": "handoff.ack",
         "status": "ok",
@@ -368,6 +435,19 @@ def emit_handoff_complete(
     # Compute result hash for drift detection
     result_hash = _compute_payload_hash(result_payload or result_summary)
 
+    # Build agent info with instance-aware ID
+    # Try to get instance_id from run's agent context for the completing agent
+    agent_info = None
+    if agent_role:
+        current_agent = run.get_current_agent()
+        instance_id = None
+        if current_agent and current_agent.get("role") == agent_role:
+            instance_id = current_agent.get("instance_id")
+        agent_info = {
+            "id": _build_agent_id(agent_role, instance_id),
+            "role": agent_role,
+        }
+
     run.emit({
         "schema_version": "trace_event.v0_1",
         "run_id": run.run_id,
@@ -378,10 +458,7 @@ def emit_handoff_complete(
         "parent_span_id": run.current_parent_span_id(),
         "seq": run.next_seq(),
         "ts": run.now(),
-        "agent": {
-            "id": f"crewai:role:{agent_role}" if agent_role else None,
-            "role": agent_role,
-        } if agent_role else None,
+        "agent": agent_info,
         "task_id": task_id,
         "event_type": "handoff.complete",
         "status": status,

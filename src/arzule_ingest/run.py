@@ -298,17 +298,72 @@ class ArzuleRun:
     # Agent Context (delegates to AgentContext)
     # =========================================================================
 
-    def set_current_agent(self, agent_info: dict[str, Any]) -> None:
-        """Set the currently active agent for this thread."""
-        self._agent_context.set_current_agent(agent_info)
+    def set_current_agent(self, agent_info: dict[str, Any]) -> str:
+        """Set the currently active agent for this thread.
 
-    def clear_current_agent(self) -> None:
-        """Clear the thread-local agent context for this thread."""
-        self._agent_context.clear_current_agent()
+        Args:
+            agent_info: Dict with agent details (id, role, instance_id, etc.)
+
+        Returns:
+            The instance_id of the agent for tracking purposes
+        """
+        return self._agent_context.set_current_agent(agent_info)
+
+    def clear_current_agent(self) -> Optional[str]:
+        """Clear the thread-local agent context for this thread.
+
+        Returns:
+            The instance_id of the cleared agent, or None if no agent was active
+        """
+        return self._agent_context.clear_current_agent()
 
     def get_current_agent(self) -> Optional[dict[str, Any]]:
         """Get the currently active agent for this thread."""
         return self._agent_context.get_current_agent()
+
+    def get_current_agent_instance_id(self) -> Optional[str]:
+        """Get the instance_id of the currently active agent."""
+        return self._agent_context.get_current_agent_instance_id()
+
+    def get_parent_agent_id(self) -> Optional[str]:
+        """Get the ID of the parent agent that spawned the current agent."""
+        return self._agent_context.get_parent_agent_id()
+
+    def get_agent_by_instance_id(self, instance_id: str) -> Optional[dict[str, Any]]:
+        """Get agent info by instance_id."""
+        return self._agent_context.get_agent_by_instance_id(instance_id)
+
+    # =========================================================================
+    # Agent Span Management (for concurrent agent execution)
+    # =========================================================================
+
+    def start_agent_span(self, agent_instance_id: str, span_id: str) -> None:
+        """Start tracking spans for an agent instance."""
+        self._span_manager.start_agent_span(agent_instance_id, span_id)
+
+    def end_agent_span(self, agent_instance_id: str) -> Optional[str]:
+        """End tracking spans for an agent instance."""
+        return self._span_manager.end_agent_span(agent_instance_id)
+
+    def push_agent_span(self, agent_instance_id: str, span_id: str) -> None:
+        """Push a span onto an agent's span stack."""
+        self._span_manager.push_agent_span(agent_instance_id, span_id)
+
+    def pop_agent_span(self, agent_instance_id: str) -> Optional[str]:
+        """Pop a span from an agent's span stack."""
+        return self._span_manager.pop_agent_span(agent_instance_id)
+
+    def get_agent_parent_span(self, agent_instance_id: str) -> Optional[str]:
+        """Get the current parent span for an agent instance."""
+        return self._span_manager.get_agent_parent_span(agent_instance_id)
+
+    def get_agent_root_span(self, agent_instance_id: str) -> Optional[str]:
+        """Get the root span for an agent instance."""
+        return self._span_manager.get_agent_root_span(agent_instance_id)
+
+    def has_agent_span(self, agent_instance_id: str) -> bool:
+        """Check if an agent instance is being tracked."""
+        return self._span_manager.has_agent_span(agent_instance_id)
 
     # =========================================================================
     # Event Emission
