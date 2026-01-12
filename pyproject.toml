@@ -1,0 +1,86 @@
+[project]
+name = "arzule-ingest"
+version = "0.8.5"
+description = "Lightweight SDK for capturing multi-agent traces (supports AutoGen v0.7+)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Arzule" }]
+keywords = ["observability", "tracing", "multi-agent", "crewai", "langchain", "langgraph", "autogen", "agents", "llm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Monitoring",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+
+# Core dependencies only - framework integrations are optional
+dependencies = [
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
+    "cryptography>=42.0.0",
+]
+
+[project.optional-dependencies]
+# Framework integrations - install what you need
+crewai = ["crewai>=0.80.0"]
+langchain = ["langchain>=0.2.0", "langchain-core>=0.2.0"]
+autogen = ["pyautogen>=0.2.0,<0.3.0"]
+all = [
+    "crewai>=0.80.0",
+    "langchain>=0.2.0",
+    "langchain-core>=0.2.0",
+    "pyautogen>=0.2.0,<0.3.0",
+]
+
+# Development dependencies
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "crewai>=0.80.0",
+    "langchain>=0.2.0",
+    "langchain-core>=0.2.0",
+    "langchain-openai>=0.1.0",
+]
+
+[project.scripts]
+arzule = "arzule_ingest.cli:main"
+arzule-claude = "arzule_ingest.claude.wrapper:main"
+arzule-claude-install = "arzule_ingest.claude.install:main"
+
+[project.urls]
+Homepage = "https://arzule.com"
+Documentation = "https://docs.arzule.com"
+Repository = "https://github.com/arzule/arzule-ingest"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/arzule_ingest"]
+
+# Exclude private/internal modules from published package
+[tool.hatch.build.targets.wheel.force-include]
+
+[tool.hatch.build]
+exclude = [
+    "src/arzule_ingest/forensics",
+    "src/arzule_ingest/demo",
+    "src/arzule_ingest/scenarios",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
