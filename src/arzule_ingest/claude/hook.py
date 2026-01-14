@@ -104,8 +104,17 @@ def _load_config() -> None:
 
     home = Path.home()
 
-    # PRIMARY: Load ~/.arzule/config (user-level config)
-    # This is the recommended way for pip-installed users
+    # Priority 1: Project-level .arzule/config (highest priority after env vars)
+    # This allows per-project Arzule configuration
+    project_config = Path.cwd() / ".arzule" / "config"
+    if project_config.exists():
+        env_vars = parse_env_file(project_config)
+        for key, value in env_vars.items():
+            if key.startswith("ARZULE_") and key not in os.environ:
+                os.environ[key] = value
+
+    # Priority 2: Global ~/.arzule/config (user-level config)
+    # This is the fallback for pip-installed users
     arzule_config = home / ".arzule" / "config"
     if arzule_config.exists():
         env_vars = parse_env_file(arzule_config)
