@@ -94,3 +94,38 @@ def is_local_endpoint(url: str) -> bool:
         True if URL is localhost/127.0.0.1
     """
     return "localhost" in url or "127.0.0.1" in url
+
+
+# =============================================================================
+# MODE-AWARE ENDPOINT RESOLUTION (NEW)
+# =============================================================================
+
+
+def get_selfhosted_endpoint() -> Optional[str]:
+    """Get the self-hosted backend endpoint URL.
+
+    Returns:
+        URL from ARZULE_SELFHOSTED_ENDPOINT env var, or None if not set
+    """
+    return os.environ.get("ARZULE_SELFHOSTED_ENDPOINT")
+
+
+def get_endpoint_for_mode(mode: str, custom_endpoint: Optional[str] = None) -> Optional[str]:
+    """Get the ingest endpoint URL for the given mode.
+
+    Args:
+        mode: SDK mode (cloud, local, selfhosted, multi)
+        custom_endpoint: Optional override endpoint
+
+    Returns:
+        Endpoint URL, or None for local mode (uses file sink)
+    """
+    if custom_endpoint:
+        return custom_endpoint
+
+    if mode == "local":
+        return None  # Local mode uses file sink, not HTTP
+    elif mode == "selfhosted":
+        return get_selfhosted_endpoint()
+    else:  # cloud (default)
+        return get_ingest_url()

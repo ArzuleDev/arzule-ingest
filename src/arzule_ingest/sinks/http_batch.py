@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from urllib.parse import urlparse
 
 from .base import TelemetrySink
+from ..mode import AuthType
 
 
 def _log_to_hook_debug(message: str) -> None:
@@ -36,29 +38,35 @@ class HttpBatchSink(TelemetrySink):
     Batch and POST trace events to an HTTP endpoint.
 
     Batches events and sends them periodically or when buffer is full.
+    Supports multiple authentication schemes for self-hosted backends.
     """
 
     def __init__(
         self,
         endpoint_url: str,
-        api_key: str,
+        api_key: Optional[str] = None,
         batch_size: int = 100,
         flush_interval_seconds: float = 5.0,
         timeout_seconds: float = 30.0,
         require_tls: bool = True,
         trace_collection_enabled: bool = True,
+        # New parameters for flexible auth
+        auth_type: AuthType = AuthType.BEARER,
+        auth_value: Optional[str] = None,
     ) -> None:
         """
         Initialize the HTTP batch sink.
 
         Args:
             endpoint_url: The ingest endpoint URL
-            api_key: API key for authentication
+            api_key: API key for authentication (backward compatibility, use auth_value instead)
             batch_size: Max events per batch
             flush_interval_seconds: Auto-flush interval
             timeout_seconds: HTTP request timeout
             require_tls: SOC2 - Require HTTPS (default: True)
             trace_collection_enabled: If False, silently discard all events (privacy opt-out)
+            auth_type: Authentication type (bearer, header, basic, none)
+            auth_value: Authentication value/token (overrides api_key if provided)
         """
         # Privacy opt-out: if disabled, don't send traces to backend
         self.trace_collection_enabled = trace_collection_enabled
@@ -73,11 +81,16 @@ class HttpBatchSink(TelemetrySink):
                 )
 
         self.endpoint_url = endpoint_url
-        self.api_key = api_key
+        self.api_key = api_key  # Keep for backward compat
+        self.auth_type = auth_type
+        self.auth_value = auth_value or api_key  # Prefer auth_value, fall back to api_key
         self.batch_size = batch_size
         self.flush_interval_seconds = flush_interval_seconds
         self.timeout_seconds = timeout_seconds
         self.require_tls = require_tls
+
+        # Build auth headers based on auth_type
+        self._auth_headers = self._build_auth_headers()
 
         # SOC2: Pre-compute safe endpoint for error logging (no query params/credentials)
         parsed = urlparse(endpoint_url)
@@ -91,6 +104,30 @@ class HttpBatchSink(TelemetrySink):
         # Start background flush thread (skip if collection disabled)
         if trace_collection_enabled:
             self._start_flush_thread()
+
+    def _build_auth_headers(self) -> dict[str, str]:
+        """Build authentication headers based on auth_type."""
+        if self.auth_type == AuthType.NONE or not self.auth_value:
+            return {}
+        elif self.auth_type == AuthType.BEARER:
+            return {"Authorization": f"Bearer {self.auth_value}"}
+        elif self.auth_type == AuthType.BASIC:
+            # auth_value should be "username:password"
+            encoded = base64.b64encode(self.auth_value.encode()).decode()
+            return {"Authorization": f"Basic {encoded}"}
+        elif self.auth_type == AuthType.HEADER:
+            # auth_value should be JSON: {"X-Api-Key": "value"}
+            try:
+                if isinstance(self.auth_value, str):
+                    return json.loads(self.auth_value)
+                elif isinstance(self.auth_value, dict):
+                    return self.auth_value
+            except (json.JSONDecodeError, TypeError):
+                pass
+            return {}
+        else:
+            # Default to bearer for unknown types
+            return {"Authorization": f"Bearer {self.auth_value}"} if self.auth_value else {}
 
     def _start_flush_thread(self) -> None:
         """Start the background flush thread."""
@@ -155,13 +192,14 @@ class HttpBatchSink(TelemetrySink):
                 json.dumps(evt, separators=(",", ":"), default=str) for evt in batch
             )
 
+            # Build request headers (auth + content type)
+            headers = {"Content-Type": "application/x-ndjson"}
+            headers.update(self._auth_headers)
+
             response = httpx.post(
                 self.endpoint_url,
                 content=payload,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/x-ndjson",
-                },
+                headers=headers,
                 timeout=self.timeout_seconds,
             )
             response.raise_for_status()

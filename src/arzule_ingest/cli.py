@@ -912,6 +912,160 @@ def cmd_setup_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_init(args: argparse.Namespace) -> int:
+    """Initialize Arzule hooks for the current project.
+
+    Creates .claude/settings.local.json with portable hooks configuration.
+    This is user-specific and git-ignored.
+    """
+    try:
+        from .claude.install import (
+            install_claude_code,
+            get_installation_status,
+            get_local_settings_path,
+            get_global_settings_path,
+        )
+    except ImportError as e:
+        print(f"Error: Claude Code module not available: {e}", file=sys.stderr)
+        return 1
+
+    # Check if .claude directory exists
+    claude_dir = Path.cwd() / ".claude"
+    if not claude_dir.exists():
+        if not args.force:
+            print(f"No .claude directory found in {Path.cwd()}")
+            print()
+            print("This doesn't appear to be a Claude Code project.")
+            print("Use --force to create .claude directory anyway.")
+            return 1
+        claude_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Created .claude directory")
+
+    # Install to local settings
+    local_path = get_local_settings_path()
+
+    # Check if already installed
+    existing_status = get_installation_status(local_path)
+    if existing_status["installed"] and not args.force:
+        print(f"Arzule hooks already installed at {local_path}")
+        print()
+        print("Use --force to reinstall.")
+        return 0
+
+    # Install with portable command
+    success = install_claude_code(local_path, force=args.force, portable=True)
+
+    if success:
+        status = get_installation_status(local_path)
+        print("Arzule initialized for this project!")
+        print()
+        print(f"  Settings: {local_path}")
+        print(f"  Type: Project-level (user-specific, git-ignored)")
+        print()
+        print("Events hooked:")
+        for event, installed in status["events"].items():
+            if installed:
+                print(f"  [x] {event}")
+        print()
+
+        # Check for global hooks and suggest migration
+        global_status = get_installation_status(get_global_settings_path())
+        if global_status["installed"]:
+            print("Note: You also have global hooks installed.")
+            print("Consider removing them to avoid duplicate tracing:")
+            print("  arzule migrate")
+        else:
+            print("Run 'claude' in this project to start tracing!")
+
+        # Check configuration
+        config = load_config()
+        if not config.get("ARZULE_API_KEY"):
+            print()
+            print("Tip: Run 'arzule configure' to set up your API key")
+            print("Or traces will be saved locally to ~/.arzule/traces/")
+
+        return 0
+    else:
+        print("Failed to initialize hooks", file=sys.stderr)
+        return 1
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    """Migrate from global hooks to project-level hooks.
+
+    Removes hooks from ~/.claude/settings.json and optionally
+    installs them to the current project.
+    """
+    try:
+        from .claude.install import (
+            install_claude_code,
+            uninstall_claude_code,
+            get_installation_status,
+            get_local_settings_path,
+            get_global_settings_path,
+        )
+    except ImportError as e:
+        print(f"Error: Claude Code module not available: {e}", file=sys.stderr)
+        return 1
+
+    global_path = get_global_settings_path()
+    local_path = get_local_settings_path()
+
+    # Check current state
+    global_status = get_installation_status(global_path)
+    local_status = get_installation_status(local_path)
+
+    print("Arzule Hook Migration")
+    print("=" * 40)
+    print()
+
+    # Show current state
+    print("Current state:")
+    print(f"  Global (~/.claude/settings.json): {'Installed' if global_status['installed'] else 'Not installed'}")
+    print(f"  Project (.claude/settings.local.json): {'Installed' if local_status['installed'] else 'Not installed'}")
+    print()
+
+    if not global_status["installed"]:
+        print("No global hooks found - nothing to migrate.")
+        if not local_status["installed"]:
+            print()
+            print("To initialize project-level hooks, run:")
+            print("  arzule init")
+        return 0
+
+    # Remove global hooks
+    print("Removing global hooks...")
+    if uninstall_claude_code(global_path):
+        print("  ✓ Global hooks removed")
+    else:
+        print("  ✗ Failed to remove global hooks", file=sys.stderr)
+        return 1
+
+    # Install to current project if it has a .claude directory
+    claude_dir = Path.cwd() / ".claude"
+    if claude_dir.exists() and not args.global_only:
+        print()
+        print("Installing project-level hooks...")
+        if install_claude_code(local_path, portable=True):
+            print(f"  ✓ Installed to {local_path}")
+        else:
+            print(f"  ✗ Failed to install to {local_path}", file=sys.stderr)
+            # Not a fatal error - global cleanup was successful
+    elif not args.global_only:
+        print()
+        print("No .claude directory in current project.")
+        print("To add hooks to a project, run 'arzule init' from that project.")
+
+    print()
+    print("Migration complete!")
+    print()
+    print("To add hooks to other projects:")
+    print("  cd /path/to/project")
+    print("  arzule init")
+
+    return 0
+
+
 def _print_env_vars():
     """Print environment variables for manual setup."""
     config = load_config()
@@ -1048,6 +1202,30 @@ def main() -> int:
         help="Check if shell instrumentation is active"
     )
     setup_status_parser.set_defaults(func=cmd_setup_status)
+
+    # === Init command (project-level hooks) ===
+    init_parser = subparsers.add_parser(
+        "init",
+        help="Initialize project-level hooks (.claude/settings.local.json)"
+    )
+    init_parser.add_argument(
+        "--force", "-f",
+        action="store_true",
+        help="Force initialization even if hooks exist or .claude doesn't exist"
+    )
+    init_parser.set_defaults(func=cmd_init)
+
+    # === Migrate command (global to project-level) ===
+    migrate_parser = subparsers.add_parser(
+        "migrate",
+        help="Migrate from global to project-level hooks"
+    )
+    migrate_parser.add_argument(
+        "--global-only",
+        action="store_true",
+        help="Only remove global hooks, don't install to current project"
+    )
+    migrate_parser.set_defaults(func=cmd_migrate)
 
     # === Claude Code commands ===
     # Special handling: 'arzule claude' without subcommand runs claude with instrumentation

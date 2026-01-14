@@ -1,7 +1,7 @@
 [project]
 name = "arzule-ingest"
-version = "0.8.5"
-description = "Lightweight SDK for capturing multi-agent traces (supports AutoGen v0.7+)"
+version = "0.9.0"
+description = "Lightweight SDK for capturing multi-agent traces with self-hosting support"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
@@ -39,6 +39,12 @@ all = [
     "pyautogen>=0.2.0,<0.3.0",
 ]
 
+# Self-hosted server (optional)
+server = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.30.0",
+]
+
 # Development dependencies
 dev = [
     "pytest>=8.0.0",
@@ -53,6 +59,8 @@ dev = [
 arzule = "arzule_ingest.cli:main"
 arzule-claude = "arzule_ingest.claude.wrapper:main"
 arzule-claude-install = "arzule_ingest.claude.install:main"
+arzule-hook = "arzule_ingest.claude.hook_cli:main"
+arzule-server = "arzule_ingest.server.cli:main"
 
 [project.urls]
 Homepage = "https://arzule.com"

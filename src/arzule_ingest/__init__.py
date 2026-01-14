@@ -12,8 +12,9 @@ from .run import ArzuleRun, current_run
 from .config import ArzuleConfig
 from .audit import AuditLogger, audit_log
 from .endpoints import get_ingest_url, get_ingest_base_url, is_local_endpoint
+from .mode import ArzuleMode, AuthType, detect_mode, create_mode_config
 
-__version__ = "0.8.5"
+__version__ = "0.9.0"
 __all__ = [
     "ArzuleRun",
     "current_run",
@@ -24,6 +25,9 @@ __all__ = [
     "new_run",
     "ensure_run",
     "shutdown",
+    # New exports for self-hosting
+    "ArzuleMode",
+    "AuthType",
 ]
 
 # Global state
@@ -99,10 +103,22 @@ def _check_langgraph_available() -> bool:
 
 
 def init(
+    # Mode selection (NEW)
+    mode: Optional[str] = None,
+    # Cloud mode (existing)
     api_key: Optional[str] = None,
     tenant_id: Optional[str] = None,
     project_id: Optional[str] = None,
     ingest_url: Optional[str] = None,
+    # Self-hosted mode (NEW)
+    endpoint: Optional[str] = None,
+    auth_type: Optional[str] = None,
+    auth_value: Optional[str] = None,
+    # Local mode (NEW)
+    output_path: Optional[str] = None,
+    # Multi mode (NEW)
+    destinations: Optional[list[dict[str, Any]]] = None,
+    # Existing options
     auto_instrument: bool = True,
     require_tls: bool = True,
     trace_collection_enabled: Optional[bool] = None,
@@ -113,109 +129,218 @@ def init(
     This is the simplest way to get started. Call once at application startup:
 
         import arzule_ingest
+        arzule_ingest.init()  # Auto-detects mode from environment
+
+    Modes:
+        - cloud (default if credentials present): Send traces to Arzule cloud
+        - local (default if no credentials): Write traces to local files
+        - selfhosted: Send traces to a custom HTTP backend
+        - multi: Send traces to multiple destinations
+
+    Examples:
+        # Cloud mode (requires credentials)
         arzule_ingest.init()
 
+        # Local mode (no credentials required)
+        arzule_ingest.init(mode="local")
+        arzule_ingest.init(mode="local", output_path="./traces/")
+
+        # Self-hosted mode
+        arzule_ingest.init(
+            mode="selfhosted",
+            endpoint="https://my-backend.com/ingest",
+            auth_type="bearer",
+            auth_value="my-token",
+        )
+
+        # Multi mode (multiple destinations)
+        arzule_ingest.init(
+            mode="multi",
+            destinations=[
+                {"mode": "cloud"},
+                {"mode": "local", "output_path": "./backup/"},
+            ]
+        )
+
     Args:
+        mode: SDK mode (cloud, local, selfhosted, multi). Auto-detected if not provided.
         api_key: API key for authentication. Defaults to ARZULE_API_KEY env var.
-        tenant_id: Tenant ID. Defaults to ARZULE_TENANT_ID env var.
-        project_id: Project ID. Defaults to ARZULE_PROJECT_ID env var.
+        tenant_id: Tenant ID. Required for cloud mode (must be UUID), optional for others.
+        project_id: Project ID. Required for cloud mode (must be UUID), optional for others.
         ingest_url: Backend URL. Defaults to ARZULE_INGEST_URL or Arzule cloud.
-        auto_instrument: If True, automatically instruments CrewAI/LangChain/LangGraph/AutoGen (if installed).
+        endpoint: Custom endpoint for selfhosted mode.
+        auth_type: Authentication type for selfhosted mode (bearer, header, basic, none).
+        auth_value: Authentication value/token for selfhosted mode.
+        output_path: File path for local mode traces.
+        destinations: List of destination configs for multi mode.
+        auto_instrument: If True, automatically instruments CrewAI/LangChain/LangGraph/AutoGen.
         require_tls: If True, requires HTTPS (recommended for production).
         trace_collection_enabled: If False, traces are silently discarded (privacy opt-out).
-            Defaults to ARZULE_TRACE_COLLECTION_ENABLED env var or True.
 
     Returns:
-        Config dict with tenant_id, project_id for reference.
+        Config dict with mode, tenant_id, project_id for reference.
 
     Raises:
-        ValueError: If required configuration is missing.
+        ValueError: If required configuration is missing for the selected mode.
     """
     global _initialized, _global_sink, _global_run, _config
 
     if _initialized:
         return _config or {}
 
-    # Load from env if not provided
-    api_key = api_key or os.environ.get("ARZULE_API_KEY")
-    tenant_id = tenant_id or os.environ.get("ARZULE_TENANT_ID")
-    project_id = project_id or os.environ.get("ARZULE_PROJECT_ID")
-    ingest_url = ingest_url or os.environ.get("ARZULE_INGEST_URL", DEFAULT_INGEST_URL)
-
-    if not api_key:
-        raise ValueError(
-            "ARZULE_API_KEY is required. Set it as an environment variable or pass to init()."
-        )
-
-    if not tenant_id or not project_id:
-        raise ValueError(
-            "ARZULE_TENANT_ID and ARZULE_PROJECT_ID are required. "
-            "Set them as environment variables or pass to init()."
-        )
-
-    # Load trace_collection_enabled from env if not provided
-    if trace_collection_enabled is None:
-        env_value = os.environ.get("ARZULE_TRACE_COLLECTION_ENABLED", "true").lower()
-        trace_collection_enabled = env_value in {"1", "true", "yes", "y"}
-
-    # Validate that tenant_id and project_id are valid UUIDs
-    import uuid
+    # Create mode configuration (handles validation per mode)
     try:
-        uuid.UUID(tenant_id)
-    except ValueError:
-        raise ValueError(
-            f"ARZULE_TENANT_ID must be a valid UUID, got: {tenant_id[:50]}..."
-            if len(tenant_id) > 50 else f"ARZULE_TENANT_ID must be a valid UUID, got: {tenant_id}"
+        mode_config = create_mode_config(
+            mode=mode,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            api_key=api_key,
+            endpoint=endpoint or ingest_url,
+            auth_type=auth_type,
+            auth_value=auth_value,
+            output_path=output_path,
+            destinations=destinations,
+            require_tls=require_tls,
+            trace_collection_enabled=trace_collection_enabled,
         )
-    try:
-        uuid.UUID(project_id)
     except ValueError:
-        raise ValueError(
-            f"ARZULE_PROJECT_ID must be a valid UUID, got: {project_id[:50]}..."
-            if len(project_id) > 50 else f"ARZULE_PROJECT_ID must be a valid UUID, got: {project_id}"
-        )
+        # Re-raise validation errors
+        raise
 
-    # Create HTTP sink
-    from .sinks.http_batch import HttpBatchSink
-
-    # Allow HTTP for localhost in development
-    is_localhost = is_local_endpoint(ingest_url)
-    _global_sink = HttpBatchSink(
-        endpoint_url=ingest_url,
-        api_key=api_key,
-        require_tls=require_tls and not is_localhost,
-        trace_collection_enabled=trace_collection_enabled,
-    )
-
-    # NOTE: Don't create the run yet - defer until first crew kicks off
-    # This prevents creating an empty "ghost" run when init() is called
-    # before any crew execution. The run will be created by ensure_run()
-    # which is called from _handle_crew_start.
+    # Create sink based on mode
+    _global_sink = _create_sink_for_mode(mode_config)
 
     # Register cleanup on exit
     atexit.register(shutdown)
 
+    # Auto-instrument frameworks
+    _auto_instrument_frameworks(auto_instrument)
+
+    _config = {
+        "mode": mode_config.mode.value,
+        "tenant_id": mode_config.tenant_id,
+        "project_id": mode_config.project_id,
+        "endpoint": mode_config.endpoint,
+        "output_path": mode_config.output_path,
+        "run_id": None,  # Will be set when run is created lazily
+        "trace_collection_enabled": mode_config.trace_collection_enabled,
+    }
+
+    _initialized = True
+
+    # Log initialization status
+    if mode_config.trace_collection_enabled:
+        if mode_config.mode == ArzuleMode.LOCAL:
+            print(f"[arzule] Initialized in LOCAL mode (traces → {mode_config.output_path})", file=sys.stderr)
+        elif mode_config.mode == ArzuleMode.SELFHOSTED:
+            print(f"[arzule] Initialized in SELFHOSTED mode (endpoint: {mode_config.endpoint})", file=sys.stderr)
+        elif mode_config.mode == ArzuleMode.MULTI:
+            print(f"[arzule] Initialized in MULTI mode ({len(mode_config.destinations or [])} destinations)", file=sys.stderr)
+        else:
+            print(f"[arzule] Initialized in CLOUD mode (run will start on first crew kickoff)", file=sys.stderr)
+    else:
+        print(f"[arzule] Initialized with trace collection DISABLED (privacy opt-out)", file=sys.stderr)
+
+    return _config
+
+
+def _create_sink_for_mode(mode_config: Any) -> Any:
+    """Create the appropriate sink based on mode configuration."""
+    from .mode import ArzuleMode, ModeConfig
+
+    if not isinstance(mode_config, ModeConfig):
+        raise TypeError("mode_config must be a ModeConfig instance")
+
+    if mode_config.mode == ArzuleMode.LOCAL:
+        from .sinks.file_jsonl import JsonlFileSink
+        from pathlib import Path
+
+        output_path = mode_config.output_path or str(Path.home() / ".arzule" / "traces")
+        # Create directory if it doesn't exist
+        Path(output_path).mkdir(parents=True, exist_ok=True)
+        # Use a timestamped file within the directory
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_path = str(Path(output_path) / f"traces_{timestamp}.jsonl")
+
+        return JsonlFileSink(
+            path=file_path,
+            compress=False,
+            encrypt=False,
+        )
+
+    elif mode_config.mode == ArzuleMode.SELFHOSTED:
+        from .sinks.http_batch import HttpBatchSink
+
+        is_localhost = is_local_endpoint(mode_config.endpoint or "")
+        return HttpBatchSink(
+            endpoint_url=mode_config.endpoint,
+            api_key=mode_config.auth_value,  # For backward compat
+            auth_type=mode_config.auth_type,
+            auth_value=mode_config.auth_value,
+            require_tls=mode_config.require_tls and not is_localhost,
+            trace_collection_enabled=mode_config.trace_collection_enabled,
+        )
+
+    elif mode_config.mode == ArzuleMode.MULTI:
+        from .sinks.multi import MultiSink
+
+        sinks = []
+        for dest in mode_config.destinations or []:
+            dest_mode = dest.get("mode", "cloud")
+            dest_config = create_mode_config(
+                mode=dest_mode,
+                tenant_id=dest.get("tenant_id"),
+                project_id=dest.get("project_id"),
+                api_key=dest.get("api_key"),
+                endpoint=dest.get("endpoint"),
+                auth_type=dest.get("auth_type"),
+                auth_value=dest.get("auth_value"),
+                output_path=dest.get("output_path"),
+                require_tls=dest.get("require_tls", True),
+                trace_collection_enabled=mode_config.trace_collection_enabled,
+            )
+            sinks.append(_create_sink_for_mode(dest_config))
+
+        return MultiSink(sinks)
+
+    else:  # CLOUD mode (default)
+        from .sinks.http_batch import HttpBatchSink
+
+        endpoint = mode_config.endpoint or get_ingest_url()
+        is_localhost = is_local_endpoint(endpoint)
+        return HttpBatchSink(
+            endpoint_url=endpoint,
+            api_key=mode_config.api_key,
+            require_tls=mode_config.require_tls and not is_localhost,
+            trace_collection_enabled=mode_config.trace_collection_enabled,
+        )
+
+
+def _auto_instrument_frameworks(auto_instrument: bool) -> None:
+    """Auto-instrument available frameworks."""
+    if not auto_instrument:
+        return
+
     # Auto-instrument CrewAI if available
-    if auto_instrument and _check_crewai_available():
+    if _check_crewai_available():
         try:
             from .crewai.install import instrument_crewai
             instrument_crewai()
         except ImportError:
-            # CrewAI integration not available, that's ok
             print("[arzule] CrewAI not installed, skipping auto-instrumentation", file=sys.stderr)
 
     # Auto-instrument LangChain if available
-    if auto_instrument and _check_langchain_available():
+    if _check_langchain_available():
         try:
             from .langchain.install import instrument_langchain
             instrument_langchain()
         except ImportError:
-            # LangChain integration not available, that's ok
             print("[arzule] LangChain not installed, skipping auto-instrumentation", file=sys.stderr)
 
     # Auto-instrument AutoGen if available (detect version)
     autogen_available, autogen_version = _check_autogen_available()
-    if auto_instrument and autogen_available:
+    if autogen_available:
         if autogen_version == "v2":
             try:
                 from .autogen_v2.install import instrument_autogen_v2
@@ -230,30 +355,12 @@ def init(
                 print(f"[arzule] AutoGen v0.2 installed but integration failed: {e}", file=sys.stderr)
 
     # Auto-instrument LangGraph if available
-    if auto_instrument and _check_langgraph_available():
+    if _check_langgraph_available():
         try:
             from .langgraph.install import instrument_langgraph
             instrument_langgraph()
         except ImportError:
-            # LangGraph integration not available, that's ok
             print("[arzule] LangGraph not installed, skipping auto-instrumentation", file=sys.stderr)
-
-    _config = {
-        "tenant_id": tenant_id,
-        "project_id": project_id,
-        "ingest_url": ingest_url,
-        "run_id": None,  # Will be set when run is created lazily
-        "trace_collection_enabled": trace_collection_enabled,
-    }
-
-    _initialized = True
-
-    if trace_collection_enabled:
-        print(f"[arzule] Initialized (run will start on first crew kickoff)", file=sys.stderr)
-    else:
-        print(f"[arzule] Initialized with trace collection DISABLED (privacy opt-out)", file=sys.stderr)
-
-    return _config
 
 
 def ensure_run() -> Optional[str]:
