@@ -13,20 +13,37 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-def _get_hook_command() -> str:
+def _get_hook_command(portable: bool = True) -> str:
     """
     Generate the hook command for Claude Code.
 
-    Uses the Python executable that's running this script, which ensures
-    the hook runs in the same environment where arzule-ingest is installed.
+    Args:
+        portable: If True (default), returns a portable command that works
+                  across machines. If False, uses the current Python executable.
+
+    Returns:
+        Command string for hook configuration.
+
+    The portable command tries arzule-hook first (fast, if installed),
+    then falls back to uvx for zero-install experience.
     """
-    python_exe = sys.executable
-    return f'{python_exe} -m arzule_ingest.claude.hook'
+    if portable:
+        # Portable: tries arzule-hook first, falls back to uvx
+        return 'command -v arzule-hook >/dev/null 2>&1 && arzule-hook || uvx arzule-ingest hook'
+    else:
+        # Legacy: absolute path to current Python (not portable)
+        python_exe = sys.executable
+        return f'{python_exe} -m arzule_ingest.claude.hook'
 
 
-def _build_hook_config() -> dict:
-    """Build hook configuration with dynamic command."""
-    command = _get_hook_command()
+def _build_hook_config(portable: bool = True) -> dict:
+    """Build hook configuration with dynamic command.
+
+    Args:
+        portable: If True, uses portable command (arzule-hook with uvx fallback).
+                  If False, uses absolute Python path (legacy).
+    """
+    command = _get_hook_command(portable=portable)
 
     return {
         "SessionStart": [
@@ -66,11 +83,15 @@ def _build_hook_config() -> dict:
     }
 
 
-# Hook configuration (built dynamically)
-HOOK_CONFIG = _build_hook_config()
+# Hook configuration (built dynamically with portable command)
+HOOK_CONFIG = _build_hook_config(portable=True)
 
-# Identifier to recognize Arzule hooks
-ARZULE_HOOK_MARKER = "arzule_ingest.claude.hook"
+# Identifiers to recognize Arzule hooks (old and new formats)
+ARZULE_HOOK_MARKERS = [
+    "arzule_ingest.claude.hook",  # Legacy: python -m arzule_ingest.claude.hook
+    "arzule-hook",                 # New: arzule-hook CLI
+    "uvx arzule-ingest",           # Fallback: uvx arzule-ingest hook
+]
 
 
 def get_settings_paths() -> list[Path]:
@@ -108,8 +129,32 @@ def find_settings_file() -> Optional[Path]:
 
 
 def get_global_settings_path() -> Path:
-    """Get the global settings path."""
+    """Get the global settings path (~/.claude/settings.json)."""
     return Path.home() / ".claude" / "settings.json"
+
+
+def get_local_settings_path() -> Path:
+    """Get the local/project settings path (.claude/settings.local.json).
+
+    This is the recommended location for project-level hooks.
+    Using settings.local.json ensures hooks are user-specific and git-ignored.
+    """
+    return Path.cwd() / ".claude" / "settings.local.json"
+
+
+def get_default_settings_path() -> Path:
+    """Get the default settings path for installation.
+
+    Returns project-level path if in a project with .claude folder,
+    otherwise returns global path.
+    """
+    # If we're in a project with .claude folder, use local
+    claude_dir = Path.cwd() / ".claude"
+    if claude_dir.exists() and claude_dir.is_dir():
+        return get_local_settings_path()
+
+    # Otherwise, use global
+    return get_global_settings_path()
 
 
 def load_settings(settings_path: Path) -> dict:
@@ -159,20 +204,28 @@ def install_claude_code(
     *,
     events: Optional[list[str]] = None,
     force: bool = False,
+    portable: bool = True,
 ) -> bool:
     """
     Install Arzule hooks into Claude Code settings.
 
     Args:
-        settings_path: Optional explicit path to settings.json (uses global if not specified)
+        settings_path: Optional explicit path to settings file.
+                       Defaults to project-level (.claude/settings.local.json) if
+                       in a project with .claude folder, otherwise global.
         events: Optional list of specific events to hook (defaults to all)
         force: If True, overwrite existing hooks
+        portable: If True (default), uses portable command (arzule-hook with uvx fallback).
+                  If False, uses absolute Python path (not recommended for project-level).
 
     Returns:
         True if installation succeeded
     """
     if settings_path is None:
-        settings_path = get_global_settings_path()
+        settings_path = get_default_settings_path()
+
+    # Build hook config with appropriate command
+    hook_config = _build_hook_config(portable=portable)
 
     settings = load_settings(settings_path)
 
@@ -181,13 +234,13 @@ def install_claude_code(
         settings["hooks"] = {}
 
     # Determine which events to install
-    events_to_install = events or list(HOOK_CONFIG.keys())
+    events_to_install = events or list(hook_config.keys())
 
     for event_name in events_to_install:
-        if event_name not in HOOK_CONFIG:
+        if event_name not in hook_config:
             continue
 
-        hook_config = HOOK_CONFIG[event_name]
+        event_hooks = hook_config[event_name]
 
         if event_name not in settings["hooks"]:
             settings["hooks"][event_name] = []
@@ -211,7 +264,7 @@ def install_claude_code(
             ]
 
         # Add Arzule hooks
-        settings["hooks"][event_name].extend(hook_config)
+        settings["hooks"][event_name].extend(event_hooks)
 
     return save_settings(settings_path, settings)
 
@@ -321,12 +374,17 @@ def get_installation_status(settings_path: Optional[Path] = None) -> dict[str, A
 
 
 def _is_arzule_hook(hook_entry: dict) -> bool:
-    """Check if a hook entry is an Arzule hook."""
+    """Check if a hook entry is an Arzule hook.
+
+    Recognizes both old format (python -m arzule_ingest.claude.hook)
+    and new format (arzule-hook with uvx fallback).
+    """
     hooks = hook_entry.get("hooks", [])
     for hook in hooks:
         command = hook.get("command", "")
-        if ARZULE_HOOK_MARKER in command:
-            return True
+        for marker in ARZULE_HOOK_MARKERS:
+            if marker in command:
+                return True
     return False
 
 
@@ -387,53 +445,120 @@ def main():
     parser.add_argument(
         "--path",
         type=Path,
-        help="Path to settings.json (defaults to ~/.claude/settings.json)"
+        help="Explicit path to settings file (overrides --global/--local)"
     )
+
+    # Location flags (mutually exclusive)
+    location_group = parser.add_mutually_exclusive_group()
+    location_group.add_argument(
+        "--global", "-g",
+        dest="use_global",
+        action="store_true",
+        help="Use global settings (~/.claude/settings.json)"
+    )
+    location_group.add_argument(
+        "--local", "-l",
+        dest="use_local",
+        action="store_true",
+        help="Use project-level settings (.claude/settings.local.json) [default if .claude exists]"
+    )
+
     parser.add_argument(
         "--force",
         action="store_true",
         help="Force reinstallation even if already installed"
     )
+    parser.add_argument(
+        "--legacy",
+        action="store_true",
+        help="Use legacy absolute Python path instead of portable command (not recommended)"
+    )
 
     args = parser.parse_args()
 
+    # Determine settings path
+    if args.path:
+        settings_path = args.path
+    elif args.use_global:
+        settings_path = get_global_settings_path()
+    elif args.use_local:
+        settings_path = get_local_settings_path()
+    else:
+        settings_path = get_default_settings_path()
+
     if args.command == "install":
-        if install_claude_code(args.path, force=args.force):
+        portable = not args.legacy
+        if install_claude_code(settings_path, force=args.force, portable=portable):
             print("Arzule hooks installed successfully")
-            status = get_installation_status(args.path)
+            status = get_installation_status(settings_path)
             print(f"  Settings: {status['settings_path']}")
+
+            # Show location info
+            is_local = "settings.local.json" in str(settings_path)
+            if is_local:
+                print("  Type: Project-level (user-specific, git-ignored)")
+            else:
+                print("  Type: Global (applies to all projects)")
+
             print()
-            print("For full observability (hooks + OTel metrics), use:")
-            print("  $ arzule-claude \"your prompt\"")
+            print("Events hooked:")
+            for event, installed in status["events"].items():
+                icon = "[x]" if installed else "[ ]"
+                print(f"  {icon} {event}")
             print()
-            print("Or run 'claude' directly (hooks only, no token metrics)")
+            print("Now run 'claude' in this project to start tracing!")
         else:
             print("Failed to install hooks", file=sys.stderr)
             sys.exit(1)
 
     elif args.command == "uninstall":
-        if uninstall_claude_code(args.path):
-            print("Arzule hooks uninstalled")
+        if uninstall_claude_code(settings_path):
+            print(f"Arzule hooks uninstalled from {settings_path}")
         else:
             print("Failed to uninstall hooks", file=sys.stderr)
             sys.exit(1)
 
     elif args.command == "status":
-        status = get_installation_status(args.path)
-        if status["installed"]:
-            print("Arzule hooks are installed")
-            print(f"  Settings: {status['settings_path']}")
-            print("  Events:")
-            for event, installed in status["events"].items():
-                icon = "[x]" if installed else "[ ]"
-                print(f"    {icon} {event}")
-            print()
-            print("Tip: Use 'arzule-claude' for full observability (hooks + OTel)")
+        # Check both locations
+        global_status = get_installation_status(get_global_settings_path())
+        local_status = get_installation_status(get_local_settings_path())
+
+        print("Arzule Hook Installation Status")
+        print("=" * 40)
+        print()
+
+        # Global status
+        print(f"Global (~/.claude/settings.json):")
+        if global_status["installed"]:
+            print("  Status: Installed")
+            for event, installed in global_status["events"].items():
+                if installed:
+                    print(f"    [x] {event}")
         else:
-            print("Arzule hooks are not installed")
+            print("  Status: Not installed")
+        print()
+
+        # Local status
+        print(f"Project (.claude/settings.local.json):")
+        if local_status["installed"]:
+            print("  Status: Installed")
+            for event, installed in local_status["events"].items():
+                if installed:
+                    print(f"    [x] {event}")
+        else:
+            print("  Status: Not installed")
+        print()
+
+        # Recommendation
+        if global_status["installed"] and not local_status["installed"]:
+            print("Tip: Consider migrating to project-level hooks:")
+            print("  arzule-claude-install uninstall --global")
+            print("  arzule-claude-install install --local")
+        elif not global_status["installed"] and not local_status["installed"]:
+            print("No Arzule hooks installed.")
             print()
             print("Run 'arzule-claude-install install' to install hooks")
-            print("Or use 'arzule-claude' directly (auto-configures OTel)")
+            print("Or use 'arzule init' to initialize this project")
 
     elif args.command == "show":
         print_installation_instructions()
