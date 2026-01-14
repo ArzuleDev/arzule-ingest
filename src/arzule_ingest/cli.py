@@ -22,15 +22,30 @@ def get_project_config_path() -> Path:
     return Path.cwd() / ".arzule" / "config"
 
 
+def find_nearest_project_config() -> Path | None:
+    """Find nearest .arzule/config by walking up the directory tree."""
+    current = Path.cwd()
+    home = Path.home()
+
+    while current != current.parent and current != home:
+        config_path = current / ".arzule" / "config"
+        if config_path.exists():
+            return config_path
+        current = current.parent
+
+    return None
+
+
 def load_config(project_level: bool = False) -> dict[str, str]:
     """Load configuration from config files.
 
     Args:
-        project_level: If True, only load from project-level config.
-                      If False (default), loads project-level first, then global as fallback.
+        project_level: If True, only load from project-level config in cwd.
+                      If False (default), walks up to find nearest project config,
+                      then falls back to global.
 
     Priority (when project_level=False):
-        1. Project-level .arzule/config (if exists)
+        1. Nearest .arzule/config walking up from cwd
         2. Global ~/.arzule/config (fallback)
     """
     config = {}
@@ -58,18 +73,17 @@ def load_config(project_level: bool = False) -> dict[str, str]:
             pass
         return result
 
-    project_config_path = get_project_config_path()
-
     if project_level:
-        # Only load project-level config
-        return parse_config_file(project_config_path)
+        # Only load project-level config from cwd
+        return parse_config_file(get_project_config_path())
 
     # Load global config first (as base)
     if ARZULE_CONFIG_FILE.exists():
         config = parse_config_file(ARZULE_CONFIG_FILE)
 
-    # Override with project-level config (higher priority)
-    if project_config_path.exists():
+    # Override with nearest project config (higher priority)
+    project_config_path = find_nearest_project_config()
+    if project_config_path:
         project_config = parse_config_file(project_config_path)
         config.update(project_config)
 
@@ -341,9 +355,21 @@ def cmd_config_show(args: argparse.Namespace) -> int:
     """Show current configuration."""
     config = load_config()
 
+    # Determine which config file is being used
+    project_config_path = find_nearest_project_config()
+    if project_config_path:
+        config_source = project_config_path
+    elif ARZULE_CONFIG_FILE.exists():
+        config_source = ARZULE_CONFIG_FILE
+    else:
+        config_source = None
+
     print("Arzule Configuration")
     print("=" * 40)
-    print(f"Config file: {ARZULE_CONFIG_FILE}")
+    if config_source:
+        print(f"Config file: {config_source}")
+    else:
+        print("Config file: (none)")
     print()
 
     if not config:
@@ -1000,18 +1026,20 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     # Check if already installed
     existing_status = get_installation_status(local_path)
-    if existing_status["installed"] and not args.force:
-        print(f"Arzule hooks already installed at {local_path}")
-        print()
-        print("Use --force to reinstall.")
-        return 0
+    hooks_already_installed = existing_status["installed"] and not args.force
 
-    # Install with portable command
-    success = install_claude_code(local_path, force=args.force, portable=True)
+    # Install with portable command (skip if already installed)
+    if hooks_already_installed:
+        success = True
+    else:
+        success = install_claude_code(local_path, force=args.force, portable=True)
 
     if success:
         status = get_installation_status(local_path)
-        print("Arzule initialized for this project!")
+        if hooks_already_installed:
+            print("Arzule hooks already installed for this project.")
+        else:
+            print("Arzule initialized for this project!")
         print()
         print(f"  Hooks: {local_path}")
         print(f"  Type: Project-level (user-specific, git-ignored)")
@@ -1029,32 +1057,82 @@ def cmd_init(args: argparse.Namespace) -> int:
             print("Consider removing them to avoid duplicate tracing:")
             print("  arzule migrate")
 
-        # Handle project-level config
+        # Handle project-level config - always prompt interactively
         project_config_path = get_project_config_path()
-        global_config = load_config(project_level=False)  # Get merged config
+        global_config = load_config(project_level=False)  # Get global config as defaults
         project_config_exists = project_config_path.exists()
 
-        if project_config_exists and not args.force:
-            print(f"  Config: {project_config_path} (existing)")
-        elif global_config.get("ARZULE_API_KEY"):
-            # Copy global config to project level
-            project_config = {
-                "ARZULE_API_KEY": global_config.get("ARZULE_API_KEY", ""),
-                "ARZULE_TENANT_ID": global_config.get("ARZULE_TENANT_ID", ""),
-                "ARZULE_PROJECT_ID": global_config.get("ARZULE_PROJECT_ID", ""),
-            }
-            # Filter out empty values
-            project_config = {k: v for k, v in project_config.items() if v}
+        # Load existing project config if it exists (for showing current values)
+        existing_project_config = {}
+        if project_config_exists:
+            existing_project_config = load_config(project_level=True)
 
-            if save_config(project_config, project_level=True):
-                print(f"  Config: {project_config_path} (copied from global)")
-            else:
-                print(f"  Config: Failed to create project config")
-        else:
+        # Use project config if exists, otherwise fall back to global as defaults
+        defaults = existing_project_config if existing_project_config else global_config
+
+        print()
+        print("Project Configuration")
+        print("-" * 40)
+        print("Enter your Arzule credentials for this project.")
+        print("Get them from https://app.arzule.com/settings")
+        print("Press Enter to keep existing value.")
+        print()
+
+        project_config = {}
+
+        # API Key
+        current_key = defaults.get("ARZULE_API_KEY", "")
+        masked = f"...{current_key[-8:]}" if len(current_key) > 8 else current_key
+        prompt = f"API Key [{masked}]: " if current_key else "API Key: "
+        try:
+            value = input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nConfiguration cancelled.")
+            return 1
+        project_config["ARZULE_API_KEY"] = value if value else current_key
+
+        # Tenant ID
+        current = defaults.get("ARZULE_TENANT_ID", "")
+        masked = f"...{current[-8:]}" if len(current) > 8 else current
+        prompt = f"Tenant ID [{masked}]: " if current else "Tenant ID: "
+        try:
+            value = input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nConfiguration cancelled.")
+            return 1
+        project_config["ARZULE_TENANT_ID"] = value if value else current
+
+        # Project ID
+        current = defaults.get("ARZULE_PROJECT_ID", "")
+        masked = f"...{current[-8:]}" if len(current) > 8 else current
+        prompt = f"Project ID [{masked}]: " if current else "Project ID: "
+        try:
+            value = input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nConfiguration cancelled.")
+            return 1
+        project_config["ARZULE_PROJECT_ID"] = value if value else current
+
+        # Filter out empty values
+        project_config = {k: v for k, v in project_config.items() if v}
+
+        # Validate required fields
+        missing = []
+        for key in ["ARZULE_API_KEY", "ARZULE_TENANT_ID", "ARZULE_PROJECT_ID"]:
+            if not project_config.get(key):
+                missing.append(key)
+
+        if missing:
             print()
-            print("No global configuration found.")
-            print("Run 'arzule configure' to set up your API key globally,")
-            print("or create .arzule/config in this project manually.")
+            print(f"Warning: Missing fields: {', '.join(missing)}")
+            print("Traces will be saved locally until configured.")
+
+        # Save project config
+        if save_config(project_config, project_level=True):
+            print()
+            print(f"  Config: {project_config_path}")
+        else:
+            print(f"  Config: Failed to create project config")
 
         print()
         print("Run 'claude' in this project to start tracing!")

@@ -67,11 +67,11 @@ def _load_config() -> None:
 
     Priority order (higher priority first):
     1. Already set environment variables (never overwritten)
-    2. ~/.arzule/config (user-level config from 'arzule configure')
-    3. Project .env file (for development/testing)
+    2. Nearest .arzule/config walking up from cwd
+    3. Global ~/.arzule/config (user-level fallback)
 
-    This ensures pip-installed users get their config from ~/.arzule/config
-    while still allowing project-level overrides via .env for development.
+    This allows subdirectories to inherit parent project config,
+    while projects with their own .arzule/config use their own.
     """
     from pathlib import Path
 
@@ -102,19 +102,31 @@ def _load_config() -> None:
             pass
         return env_vars
 
+    def find_project_config(start_dir: Path) -> Path | None:
+        """Find nearest .arzule/config by walking up the directory tree."""
+        current = start_dir
+        home = Path.home()
+
+        # Walk up to find nearest .arzule/config
+        while current != current.parent and current != home:
+            config_path = current / ".arzule" / "config"
+            if config_path.exists():
+                return config_path
+            current = current.parent
+
+        return None
+
     home = Path.home()
 
-    # Priority 1: Project-level .arzule/config (highest priority after env vars)
-    # This allows per-project Arzule configuration
-    project_config = Path.cwd() / ".arzule" / "config"
-    if project_config.exists():
+    # Priority 1: Project-level .arzule/config (with parent inheritance)
+    project_config = find_project_config(Path.cwd())
+    if project_config:
         env_vars = parse_env_file(project_config)
         for key, value in env_vars.items():
             if key.startswith("ARZULE_") and key not in os.environ:
                 os.environ[key] = value
 
-    # Priority 2: Global ~/.arzule/config (user-level config)
-    # This is the fallback for pip-installed users
+    # Priority 2: Global ~/.arzule/config (user-level fallback)
     arzule_config = home / ".arzule" / "config"
     if arzule_config.exists():
         env_vars = parse_env_file(arzule_config)
