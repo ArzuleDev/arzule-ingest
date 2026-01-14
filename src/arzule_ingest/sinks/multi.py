@@ -28,11 +28,11 @@ class MultiSink(TelemetrySink):
         """
         self.sinks = sinks
     
-    def emit(self, event: dict[str, Any]) -> None:
-        """Emit event to all sinks."""
+    def write(self, event: dict[str, Any]) -> None:
+        """Write event to all sinks."""
         for sink in self.sinks:
             try:
-                sink.emit(event)
+                sink.write(event)
             except Exception:
                 pass  # Best effort - don't let one sink failure block others
     
