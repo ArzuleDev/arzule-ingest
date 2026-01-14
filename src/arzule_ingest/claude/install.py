@@ -57,10 +57,10 @@ def _build_hook_config(portable: bool = True) -> dict:
             {"hooks": [{"type": "command", "command": command}]}
         ],
         "PreToolUse": [
-            {"matcher": ".*", "hooks": [{"type": "command", "command": command}]}
+            {"matcher": "*", "hooks": [{"type": "command", "command": command}]}
         ],
         "PostToolUse": [
-            {"matcher": ".*", "hooks": [{"type": "command", "command": command}]}
+            {"matcher": "*", "hooks": [{"type": "command", "command": command}]}
         ],
         "SubagentStart": [
             # CRITICAL: Captures subagent start for agent_id mapping (v2.0.43+)
