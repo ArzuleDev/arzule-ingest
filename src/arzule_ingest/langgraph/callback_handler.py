@@ -415,6 +415,17 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
             }
             self._maybe_trigger_validators(run, "langgraph.node.end", node_event_data, span_id)
 
+            # Trigger validators for state update
+            if isinstance(outputs, dict) and outputs:
+                state_event_data = {
+                    "node_name": node_name,
+                    "state_before": node_input,
+                    "state_update": outputs,
+                    "state_after": outputs,
+                    "state_channels": list(outputs.keys()),
+                }
+                self._maybe_trigger_validators(run, "langgraph.state.update", state_event_data, span_id)
+
             # Check if output contains Send objects for parallel fan-out detection
             self._maybe_emit_parallel_fanout(run, node_name, outputs, span_id, parent_span)
 
