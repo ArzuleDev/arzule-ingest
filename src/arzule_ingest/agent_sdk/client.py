@@ -579,6 +579,9 @@ class TracedClaudeClient:
         if not self._sink or not self._state:
             return
 
+        # Build agent ID in format: claude_agent_sdk:main:{session_id}
+        agent_id = f"claude_agent_sdk:main:{self._state.session_id}"
+
         event = {
             "schema_version": "trace_event.v0_1",
             "run_id": self._state.run_id,
@@ -589,6 +592,10 @@ class TracedClaudeClient:
             "parent_span_id": parent_span_id,
             "seq": self._next_seq(),
             "ts": self._now(),
+            "agent": {
+                "id": agent_id,
+                "role": "main",
+            },
             "event_type": event_type,
             "status": status,
             "summary": summary,
