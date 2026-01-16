@@ -525,3 +525,10 @@ def shutdown() -> None:
             pass
         _global_sink = None
 
+
+# Optional: Claude Agent SDK integration
+try:
+    from .agent_sdk import TracedClaudeClient
+    __all__.append("TracedClaudeClient")
+except ImportError:
+    pass  # claude-agent-sdk not installed

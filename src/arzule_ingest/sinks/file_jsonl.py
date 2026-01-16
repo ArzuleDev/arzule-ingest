@@ -131,6 +131,52 @@ class JsonlFileSink(TelemetrySink):
             self._file.close()
             self._file = None
 
+    def get_last_session_id(self) -> str | None:
+        """
+        Extract session_id from the last event in the file.
+
+        This is useful for resuming sessions across process restarts.
+
+        Returns:
+            The session_id from the last event's payload, or None if:
+            - The file doesn't exist
+            - The file is empty
+            - The last event has no session_id in its payload
+        """
+        if not self._path.exists():
+            return None
+
+        try:
+            # Read the file to get the last line
+            with open(self._path, "r", encoding="utf-8") as f:
+                last_line = None
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        last_line = line
+
+            if not last_line:
+                return None
+
+            # Handle encrypted content
+            if self._fernet:
+                import base64
+                decrypted = self._fernet.decrypt(base64.b64decode(last_line))
+                last_line = decrypted.decode("utf-8")
+
+            # Parse JSON and extract session_id from payload
+            event = json.loads(last_line)
+            payload = event.get("payload", {})
+            return payload.get("session_id")
+
+        except (json.JSONDecodeError, OSError, ValueError):
+            return None
+
+    @property
+    def _path(self) -> Path:
+        """Return the file path (alias for self.path for consistency)."""
+        return self.path
+
     def __enter__(self) -> "JsonlFileSink":
         return self
 
