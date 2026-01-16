@@ -101,6 +101,7 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
         self._graph_names: Dict[str, str] = {}  # run_id -> graph_name
         self._node_names: Dict[str, str] = {}  # run_id -> node_name
         self._node_metadata: Dict[str, Dict[str, Any]] = {}  # run_id -> metadata (for parallel tracking)
+        self._node_inputs: Dict[str, Any] = {}  # run_id -> input_data (for validator triggering)
         self._tool_names: Dict[str, str] = {}  # run_id -> tool_name
         
         # Parallel execution tracking
@@ -303,6 +304,7 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
             run_key = self._get_run_key(run_id)
             self._node_names[run_key] = chain_name
             self._node_metadata[run_key] = metadata or {}  # Store for node_end
+            self._node_inputs[run_key] = inputs  # Store input state for validator triggering
             
             # Track parallel execution by step
             # Nodes in the same step (superstep) execute in parallel
@@ -375,14 +377,15 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
         elif run_key in self._node_names and self.enable_node:
             node_name = self._node_names.pop(run_key)
             node_metadata = self._node_metadata.pop(run_key, None)
-            
+            node_input = self._node_inputs.pop(run_key, None)
+
             # Track last completed node for conditional routing handoff detection
             # This helps us determine the source when we see "branch:to:X" triggers
             self._last_completed_node = node_name
-            
+
             # Check for handoff.complete if this node was a handoff target
             self._maybe_emit_handoff_complete(run, node_name, outputs, span_id, parent_span)
-            
+
             evt = evt_node_end(
                 run=run,
                 span_id=span_id,
@@ -394,12 +397,52 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
             # evt is None if this is an internal routing channel
             if evt:
                 run.emit(evt)
-            
+
+            # Trigger validators for node completion
+            # Extract graph name from parent run if available
+            graph_name = None
+            if parent_run_id:
+                parent_key = self._get_run_key(parent_run_id)
+                graph_name = self._graph_names.get(parent_key)
+
+            node_event_data = {
+                "node_name": node_name,
+                "graph_name": graph_name,
+                "node_input": node_input,
+                "node_output": outputs,
+                "state_after": outputs,
+                "state_channels": list(outputs.keys()) if isinstance(outputs, dict) else [],
+            }
+            self._maybe_trigger_validators(run, "langgraph.node.end", node_event_data, span_id)
+
+            # Trigger validators for state update
+            if isinstance(outputs, dict) and outputs:
+                state_event_data = {
+                    "node_name": node_name,
+                    "state_before": node_input,
+                    "state_update": outputs,
+                    "state_after": outputs,
+                    "state_channels": list(outputs.keys()),
+                }
+                self._maybe_trigger_validators(run, "langgraph.state.update", state_event_data, span_id)
+
             # Check if output contains Send objects for parallel fan-out detection
             self._maybe_emit_parallel_fanout(run, node_name, outputs, span_id, parent_span)
-            
+
             # Check if output contains a Command for handoff detection
+            # Also detect conditional routing for edge traversal validator triggering
             self._maybe_emit_handoff_proposed(run, node_name, outputs, span_id, parent_span)
+
+            # Trigger validators for edge traversal if conditional routing detected
+            state_target = self._extract_state_routing_target(outputs)
+            if state_target:
+                edge_event_data = {
+                    "source_node": node_name,
+                    "target_nodes": [state_target],
+                    "edge_condition": "state_routing",
+                    "edge_result": state_target,
+                }
+                self._maybe_trigger_validators(run, "langgraph.edge.traverse", edge_event_data, span_id)
 
     def on_chain_error(
         self,
@@ -662,6 +705,48 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
         run.emit(evt)
 
     # =========================================================================
+    # Validator Triggering
+    # =========================================================================
+
+    def _maybe_trigger_validators(
+        self,
+        run: "ArzuleRun",
+        event_type: str,
+        event_data: Dict[str, Any],
+        span_id: str,
+    ) -> None:
+        """Trigger validators for LangGraph events.
+
+        This method is called after emitting trace events to allow validators
+        to analyze the event data. If no validator hooks are registered or
+        if the hooks module is not available, this method is a no-op.
+
+        Args:
+            run: The current ArzuleRun instance (may be None, in which case
+                we attempt to get the current run).
+            event_type: The type of LangGraph event (e.g., "langgraph.node.end").
+            event_data: Dictionary containing event-specific data.
+            span_id: The span ID associated with this event.
+        """
+        # Get run with fallback if not provided
+        if run is None:
+            run = current_run()
+            if run is None:
+                return
+
+        try:
+            from ..validators.hooks import get_validator_hooks
+        except ImportError:
+            # Validator hooks not available
+            return
+
+        hooks = get_validator_hooks()
+        if not hooks:
+            return
+
+        hooks.on_event(run, event_type, event_data, span_id)
+
+    # =========================================================================
     # Helper Methods
     # =========================================================================
 
@@ -838,17 +923,28 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
         
         if not target_nodes:
             return
-        
+
+        unique_targets = list(set(target_nodes))
+        fanout_span_id = new_span_id()
+
         # Emit parallel fanout event
         evt = evt_parallel_fanout(
             run=run,
-            span_id=new_span_id(),
+            span_id=fanout_span_id,
             parent_span_id=parent_span or run.current_parent_span_id(),
             source_node=from_node,
-            target_nodes=list(set(target_nodes)),  # Unique nodes
+            target_nodes=unique_targets,
             send_count=len(sends),
         )
         run.emit(evt)
+
+        # Trigger validators for parallel fanout
+        fanout_event_data = {
+            "source_node": from_node,
+            "send_targets": unique_targets,
+            "send_count": len(sends),
+        }
+        self._maybe_trigger_validators(run, "langgraph.parallel.fanout", fanout_event_data, fanout_span_id)
 
     # =========================================================================
     # Handoff Detection (for multi-agent coordination)
@@ -1442,25 +1538,28 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
     ) -> None:
         """Emit handoff.complete event if this node was a handoff target."""
         handoff_keys = self._handoff_targets.pop(node_name, [])
-        
+
         for handoff_key in handoff_keys:
             pending = self._handoff_pending.pop(handoff_key, None)
             if not pending:
                 continue
-            
+
             from_node = pending.get("from_node", "unknown")
             status = "error" if error else "ok"
-            
+
             # Extract meaningful payload (filter out routing fields and terminal markers)
             meaningful_result = self._extract_meaningful_payload(result) if not error else None
-            
+
+            # Generate span_id for the handoff complete event
+            handoff_complete_span_id = new_span_id()
+
             # Skip emitting handoff.complete if the result is just a terminal marker
             # This prevents false positive drift detection for final/coordinator nodes
             if meaningful_result is None and not error:
                 # Still track that we completed, but mark as terminal
                 evt = evt_handoff_complete(
                     run=run,
-                    span_id=new_span_id(),
+                    span_id=handoff_complete_span_id,
                     parent_span_id=parent_span or run.current_parent_span_id(),
                     handoff_key=handoff_key,
                     from_node=from_node,
@@ -1472,7 +1571,7 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
             else:
                 evt = evt_handoff_complete(
                     run=run,
-                    span_id=new_span_id(),
+                    span_id=handoff_complete_span_id,
                     parent_span_id=parent_span or run.current_parent_span_id(),
                     handoff_key=handoff_key,
                     from_node=from_node,
@@ -1484,4 +1583,11 @@ class ArzuleLangGraphHandler(_BASE_CLASS):
             # evt is None if from_node or to_node are internal routing channels
             if evt:
                 run.emit(evt)
+
+            # Trigger validators for handoff completion
+            handoff_event_data = {
+                "from_node": from_node,
+                "to_node": node_name,
+            }
+            self._maybe_trigger_validators(run, "langgraph.handoff.complete", handoff_event_data, handoff_complete_span_id)
 
