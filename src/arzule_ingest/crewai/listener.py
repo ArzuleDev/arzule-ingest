@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from ..run import current_run
 from ..logger import get_logger, log_event_dropped
@@ -167,6 +167,7 @@ class ArzuleCrewAIListener:
             @bus.on(AgentExecutionCompletedEvent)
             def on_agent_complete(source: Any, event: AgentExecutionCompletedEvent) -> None:
                 self._handle_event(event)
+                self._maybe_trigger_validators(event, "crewai.agent.execution.completed")
 
             @bus.on(AgentExecutionErrorEvent)
             def on_agent_error(source: Any, event: AgentExecutionErrorEvent) -> None:
@@ -196,6 +197,7 @@ class ArzuleCrewAIListener:
                 self._handle_event(event)
                 self._check_handoff_complete(event, status="ok")
                 self._complete_implicit_handoffs(event, status="ok")
+                self._maybe_trigger_validators(event, "crewai.task.completed")
 
             @bus.on(TaskFailedEvent)
             def on_task_failed(source: Any, event: TaskFailedEvent) -> None:
@@ -226,6 +228,7 @@ class ArzuleCrewAIListener:
             def on_tool_end(source: Any, event: ToolUsageFinishedEvent) -> None:
                 self._handle_event(event)
                 self._maybe_emit_delegation_handoff(event)
+                self._maybe_trigger_validators(event, "crewai.tool.usage.finished")
 
             @bus.on(ToolUsageErrorEvent)
             def on_tool_error(source: Any, event: ToolUsageErrorEvent) -> None:
@@ -331,6 +334,7 @@ class ArzuleCrewAIListener:
             @bus.on(MethodExecutionFinishedEvent)
             def on_method_end(source: Any, event: MethodExecutionFinishedEvent) -> None:
                 self._handle_event(event)
+                self._maybe_trigger_validators(event, "crewai.flow.method.finished")
 
             @bus.on(MethodExecutionFailedEvent)
             def on_method_failed(source: Any, event: MethodExecutionFailedEvent) -> None:
@@ -480,6 +484,7 @@ class ArzuleCrewAIListener:
             @bus.on(A2ADelegationCompletedEvent)
             def on_a2a_delegation_complete(source: Any, event: A2ADelegationCompletedEvent) -> None:
                 self._handle_event(event)
+                self._maybe_trigger_validators(event, "crewai.a2a.delegation.completed")
 
             @bus.on(A2AConversationStartedEvent)
             def on_a2a_conversation_start(source: Any, event: A2AConversationStartedEvent) -> None:
@@ -827,13 +832,63 @@ class ArzuleCrewAIListener:
 
     def _cleanup_implicit_handoff_tracking(self) -> None:
         """Clean up implicit handoff tracking when a crew/flow completes.
-        
+
         Clears the last completed task tracking to prevent stale data
         from affecting subsequent runs.
         """
         run = current_run(run_id_hint=self._get_cached_run_id())
         if run:
             cleanup_run_tracking(run.run_id)
+
+    def _maybe_trigger_validators(self, event: Any, event_type: str) -> None:
+        """Trigger validators for this event if configured.
+
+        Called after the trace event is emitted.
+        """
+        from ..validators.hooks import get_validator_hooks
+
+        hooks = get_validator_hooks()
+        if not hooks:
+            return
+
+        run = current_run(run_id_hint=self._get_cached_run_id())
+        if not run:
+            return
+
+        # Build event data from CrewAI event
+        event_data = self._extract_event_data(event)
+        span_id = getattr(event, "span_id", None) or run.current_parent_span_id()
+
+        hooks.on_event(run, event_type, event_data, span_id)
+
+    def _extract_event_data(self, event: Any) -> Dict[str, Any]:
+        """Extract relevant data from a CrewAI event for validation."""
+        data: Dict[str, Any] = {}
+
+        # Agent info
+        agent = getattr(event, "agent", None)
+        if agent:
+            data["agent_role"] = getattr(agent, "role", None)
+            data["agent_goal"] = getattr(agent, "goal", None)
+            data["agent_backstory"] = getattr(agent, "backstory", None)
+            data["tools"] = [t.name for t in getattr(agent, "tools", []) if hasattr(t, "name")]
+
+        # Task info
+        task = getattr(event, "task", None)
+        if task:
+            data["task_description"] = getattr(task, "description", None)
+            data["task_output"] = getattr(event, "output", None) or getattr(event, "result", None)
+
+        # Tool info
+        data["tool_name"] = getattr(event, "tool_name", None)
+        data["tool_input"] = getattr(event, "tool_args", None) or getattr(event, "tool_input", None)
+        data["tool_output"] = getattr(event, "tool_output", None) or getattr(event, "result", None)
+
+        # Delegation info
+        data["delegated_to"] = getattr(event, "to_agent", None) or getattr(event, "delegated_to", None)
+        data["delegation_reason"] = getattr(event, "reason", None)
+
+        return data
 
 
 def get_listener() -> ArzuleCrewAIListener:
