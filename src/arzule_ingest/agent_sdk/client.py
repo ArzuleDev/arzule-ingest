@@ -229,7 +229,8 @@ def _create_tracing_hooks(
         context: HookContext,
     ) -> HookJSONOutput:
         """Capture tool invocation start events."""
-        if not isinstance(hook_input, PreToolUseHookInput):
+        # Check for PreToolUseHookInput by key presence (TypedDict doesn't support isinstance)
+        if not isinstance(hook_input, dict) or "tool_name" not in hook_input or "tool_input" not in hook_input:
             return {}
 
         span_id = new_span_id()
@@ -254,7 +255,8 @@ def _create_tracing_hooks(
         context: HookContext,
     ) -> HookJSONOutput:
         """Capture tool completion events."""
-        if not isinstance(hook_input, PostToolUseHookInput):
+        # Check for PostToolUseHookInput by key presence (TypedDict doesn't support isinstance)
+        if not isinstance(hook_input, dict) or "tool_name" not in hook_input or "tool_response" not in hook_input:
             return {}
 
         # Look up the span we started
@@ -286,7 +288,8 @@ def _create_tracing_hooks(
         context: HookContext,
     ) -> HookJSONOutput:
         """Capture user prompt submission events."""
-        if not isinstance(hook_input, UserPromptSubmitHookInput):
+        # Check for UserPromptSubmitHookInput by key presence (TypedDict doesn't support isinstance)
+        if not isinstance(hook_input, dict) or "prompt" not in hook_input:
             return {}
 
         # Start a new turn span
@@ -312,7 +315,8 @@ def _create_tracing_hooks(
         context: HookContext,
     ) -> HookJSONOutput:
         """Capture session stop events."""
-        if not isinstance(hook_input, StopHookInput):
+        # StopHookInput is a dict - just check it's a dict (TypedDict doesn't support isinstance)
+        if not isinstance(hook_input, dict):
             return {}
 
         # End the current turn if one is active
