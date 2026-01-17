@@ -525,3 +525,35 @@ def shutdown() -> None:
             pass
         _global_sink = None
 
+
+# Optional: Claude Agent SDK integration
+try:
+    from .agent_sdk import TracedClaudeClient
+    __all__.append("TracedClaudeClient")
+except ImportError:
+    pass  # claude-agent-sdk not installed
+
+# Optional: Validators integration for parallel out-of-band validation
+try:
+    from .validators import (
+        ValidatorsClient,
+        ValidatorHooks,
+        DeterministicRiskGate,
+        RiskAssessment,
+        ValidationLevel,
+        SpawnRequest,
+        SpawnResponse,
+        ValidationResult,
+    )
+    __all__.extend([
+        "ValidatorsClient",
+        "ValidatorHooks",
+        "DeterministicRiskGate",
+        "RiskAssessment",
+        "ValidationLevel",
+        "SpawnRequest",
+        "SpawnResponse",
+        "ValidationResult",
+    ])
+except ImportError:
+    pass  # validators module dependencies not available

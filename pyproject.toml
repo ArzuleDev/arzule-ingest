@@ -39,6 +39,9 @@ all = [
     "pyautogen>=0.2.0,<0.3.0",
 ]
 
+# Claude Agent SDK integration
+agent-sdk = ["claude-agent-sdk>=0.1.0"]
+
 # Self-hosted server (optional)
 server = [
     "fastapi>=0.100.0",
@@ -87,6 +90,8 @@ exclude = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [dependency-groups]
 dev = [
